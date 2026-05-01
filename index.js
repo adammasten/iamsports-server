@@ -10,16 +10,25 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
-
 app.get('/', (req, res) => {
-  res.json({ status: 'IamSports server running!' });
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+  res.json({ 
+    status: 'IamSports server running!',
+    hasUrl: !!supabaseUrl,
+    hasKey: !!supabaseKey
+  });
 });
 
 app.post('/export', async (req, res) => {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+
+  if (!supabaseUrl || !supabaseKey) {
+    return res.status(500).json({ error: 'Missing Supabase credentials' });
+  }
+
+  const supabase = createClient(supabaseUrl, supabaseKey);
   const { clips, outputFileName } = req.body;
 
   if (!clips || clips.length === 0) {
