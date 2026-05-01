@@ -6,29 +6,19 @@ const https = require('https');
 const http = require('http');
 const { createClient } = require('@supabase/supabase-js');
 
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wscfpkaltajnrhiusoze.supabase.co';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzY2Zwa2FsdGFqbnJoaXVzb3plIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzQyOTE3OSwiZXhwIjoyMDkzMDA1MTc5fQ.EGAIIqEwwWXs3_hENzrExZum56AqFMbWCj-czXaR1GE';
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
-  res.json({ 
-    status: 'IamSports server running!',
-    hasUrl: !!supabaseUrl,
-    hasKey: !!supabaseKey
-  });
+  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL });
 });
 
 app.post('/export', async (req, res) => {
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
-
-  if (!supabaseUrl || !supabaseKey) {
-    return res.status(500).json({ error: 'Missing Supabase credentials' });
-  }
-
-  const supabase = createClient(supabaseUrl, supabaseKey);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
   const { clips, outputFileName } = req.body;
 
   if (!clips || clips.length === 0) {
