@@ -36,7 +36,9 @@ app.post('/export', async (req, res) => {
       const trimmedPath = `${tmpDir}/trimmed_${i}.mp4`;
 
       await downloadFile(clip.url, filePath);
-      execSync(`ffmpeg -i ${filePath} -ss ${clip.start_time} -to ${clip.end_time} -c copy ${trimmedPath} -y`);
+
+      // Trim and normalize rotation
+      execSync(`ffmpeg -i ${filePath} -ss ${clip.start_time} -to ${clip.end_time} -c:v libx264 -c:a aac -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2" ${trimmedPath} -y`);
       downloadedFiles.push(trimmedPath);
     }
 
@@ -45,6 +47,8 @@ app.post('/export', async (req, res) => {
     fs.writeFileSync(concatFile, concatContent);
 
     const outputPath = `${tmpDir}/output.mp4`;
+
+    // Stitch all clips together
     execSync(`ffmpeg -f concat -safe 0 -i ${concatFile} -c copy ${outputPath} -y`);
 
     const fileBuffer = fs.readFileSync(outputPath);
