@@ -5,7 +5,6 @@ const fs = require('fs');
 const https = require('https');
 const http = require('http');
 const { createClient } = require('@supabase/supabase-js');
-const { v4: uuidv4 } = require('uuid');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wscfpkaltajnrhiusoze.supabase.co';
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzY2Zwa2FsdGFqbnJoaXVzb3plIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzQyOTE3OSwiZXhwIjoyMDkzMDA1MTc5fQ.EGAIIqEwwWXs3_hENzrExZum56AqFMbWCj-czXaR1GE';
@@ -27,7 +26,7 @@ app.post('/export', async (req, res) => {
     return res.status(400).json({ error: 'No clips provided' });
   }
 
-  const jobId = uuidv4();
+  const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
   jobs[jobId] = { status: 'processing', url: null, error: null, progress: 0 };
 
   res.json({ jobId });
