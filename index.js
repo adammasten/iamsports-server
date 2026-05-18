@@ -1,6 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const { execSync } = require('child_process');
+const { exec } = require('child_process');
+const { promisify } = require('util');
+const execAsync = promisify(exec);
 const fs = require('fs');
 const https = require('https');
 const http = require('http');
@@ -23,7 +25,17 @@ app.post('/export', async (req, res) => {
       return res.status(400).json({ error: 'No clips provided' });
     }
     const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
-    jobs[jobId] = { status: 'processing', url: null, error: null, progress: 0, stage: 'starting' };
+    jobs[jobId] = {
+      status: 'processing',
+      url: null,
+      error: null,
+      progress: 0,
+      stage: 'starting',
+      phaseItem: null,
+      phaseTotal: null,
+      label: 'Queued...',
+      createdAt: Date.now(),
+    };
     res.json({ jobId });
     processExport(jobId, clips, outputFileName);
   } catch (e) {
@@ -54,6 +66,9 @@ async function processExport(jobId, clips, outputFileName) {
     for (let i = 0; i < uniqueUrls.length; i++) {
       const url = uniqueUrls[i];
       const sourcePath = `${tmpDir}/source_${i}.mp4`;
+      jobs[jobId].phaseItem = i + 1;
+      jobs[jobId].phaseTotal = uniqueUrls.length;
+      jobs[jobId].label = `Downloading source ${i + 1} of ${uniqueUrls.length}...`;
       console.log(`[${jobId}] Downloading source ${i + 1}/${uniqueUrls.length}`);
       await downloadFile(url, sourcePath);
       sourceMap[url] = sourcePath;
@@ -71,9 +86,15 @@ async function processExport(jobId, clips, outputFileName) {
       const trimmedPath = `${tmpDir}/trimmed_${i}.mp4`;
       const startTime = clip.start_time;
       const duration = clip.end_time - clip.start_time;
+      jobs[jobId].phaseItem = i + 1;
+      jobs[jobId].phaseTotal = clips.length;
+      jobs[jobId].label = `Trimming clip ${i + 1} of ${clips.length}...`;
       console.log(`[${jobId}] Trimming clip ${i + 1}/${clips.length}: ${duration.toFixed(1)}s starting at ${startTime.toFixed(1)}s`);
 
-      execSync(`ffmpeg -ss ${startTime} -i ${sourcePath} -t ${duration} -vf "fps=30,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1" -c:v libx264 -preset fast -crf 23 -c:a aac -ar 48000 -ac 2 -fps_mode cfr -async 1 -movflags +faststart ${trimmedPath} -y 2>&1`, { stdio: 'pipe' });
+      // execAsync (not execSync) so the Node event loop keeps servicing /job/:id
+      // status polls while ffmpeg runs in its child process. maxBuffer raised to
+      // 10MB so ffmpeg's verbose stderr (redirected via 2>&1) doesn't overflow.
+      await execAsync(`ffmpeg -ss ${startTime} -i ${sourcePath} -t ${duration} -vf "fps=30,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1" -c:v libx264 -preset fast -crf 23 -c:a aac -ar 48000 -ac 2 -fps_mode cfr -async 1 -movflags +faststart ${trimmedPath} -y 2>&1`, { maxBuffer: 10 * 1024 * 1024 });
       trimmedFiles.push(trimmedPath);
       jobs[jobId].progress = 50 + Math.round(((i + 1) / clips.length) * 25);
     }
@@ -87,16 +108,20 @@ async function processExport(jobId, clips, outputFileName) {
     // PHASE 4: Concatenate trimmed clips
     jobs[jobId].stage = 'concatenating';
     jobs[jobId].progress = 80;
+    jobs[jobId].phaseItem = null;
+    jobs[jobId].phaseTotal = null;
+    jobs[jobId].label = 'Joining clips...';
     const concatFile = `${tmpDir}/concat.txt`;
     const concatContent = trimmedFiles.map(f => `file '${f}'`).join('\n');
     fs.writeFileSync(concatFile, concatContent);
     const outputPath = `${tmpDir}/output.mp4`;
     console.log(`[${jobId}] Concatenating ${trimmedFiles.length} clips`);
-    execSync(`ffmpeg -f concat -safe 0 -i ${concatFile} -c copy ${outputPath} -y 2>&1`, { stdio: 'pipe' });
+    await execAsync(`ffmpeg -f concat -safe 0 -i ${concatFile} -c copy ${outputPath} -y 2>&1`, { maxBuffer: 10 * 1024 * 1024 });
 
     // PHASE 5: Upload final video to Supabase
     jobs[jobId].stage = 'uploading';
     jobs[jobId].progress = 90;
+    jobs[jobId].label = 'Uploading highlight reel...';
     const fileBuffer = fs.readFileSync(outputPath);
     const fileName = `exports/${Date.now()}.mp4`;
     console.log(`[${jobId}] Uploading ${(fileBuffer.length / 1024 / 1024).toFixed(0)} MB highlight reel to Supabase`);
@@ -116,6 +141,7 @@ async function processExport(jobId, clips, outputFileName) {
     jobs[jobId].url = urlData.publicUrl;
     jobs[jobId].progress = 100;
     jobs[jobId].stage = 'done';
+    jobs[jobId].label = 'Complete!';
     console.log(`[${jobId}] Export complete: ${urlData.publicUrl}`);
 
   } catch (error) {
@@ -153,6 +179,25 @@ function downloadFile(url, dest) {
     });
   });
 }
+
+// Drop jobs older than 1 hour. In-memory only — Railway restart wipes the
+// Map regardless. Wrapped in try/catch so a bad iteration can't kill the
+// interval timer.
+const JOB_TTL_MS = 60 * 60 * 1000;
+const JOB_CLEANUP_INTERVAL_MS = 30 * 60 * 1000;
+setInterval(() => {
+  try {
+    const now = Date.now();
+    for (const id of Object.keys(jobs)) {
+      if (now - (jobs[id].createdAt || 0) > JOB_TTL_MS) {
+        delete jobs[id];
+        console.log(`[cleanup] dropped stale job ${id}`);
+      }
+    }
+  } catch (e) {
+    console.error('[cleanup] interval error:', e.message);
+  }
+}, JOB_CLEANUP_INTERVAL_MS);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
