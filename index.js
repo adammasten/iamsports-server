@@ -8,7 +8,7 @@ const https = require('https');
 const http = require('http');
 const { createClient } = require('@supabase/supabase-js');
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wscfpkaltajnrhiusoze.supabase.co';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndzY2Zwa2FsdGFqbnJoaXVzb3plIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzQyOTE3OSwiZXhwIjoyMDkzMDA1MTc5fQ.EGAIIqEwwWXs3_hENzrExZum56AqFMbWCj-czXaR1GE';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -51,7 +51,7 @@ app.get('/job/:jobId', (req, res) => {
 });
 
 async function processExport(jobId, clips, outputFileName) {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   const tmpDir = `/tmp/${jobId}`;
   fs.mkdirSync(tmpDir, { recursive: true });
   console.log(`[${jobId}] Starting export with ${clips.length} clips`);
