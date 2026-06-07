@@ -14,6 +14,13 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 const jobs = {};
 
+// Signed-URL lifetimes (seconds). Source URLs only need to outlive a single
+// download (downloadFile caps at 30 min); 1h gives margin. The output URL is
+// handed to the client to save to the camera roll — 24h so an offline or
+// delayed retry doesn't lose the export.
+const SOURCE_URL_TTL_SECONDS = 3600;   // 1 hour
+const OUTPUT_URL_TTL_SECONDS = 86400;  // 24 hours
+
 app.get('/', (req, res) => {
   res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL });
 });
@@ -57,24 +64,28 @@ async function processExport(jobId, clips, outputFileName) {
   console.log(`[${jobId}] Starting export with ${clips.length} clips`);
 
   try {
-    // PHASE 1: Download each unique source video ONCE (was N times!)
-    const uniqueUrls = [...new Set(clips.map(c => c.url))];
-    console.log(`[${jobId}] Downloading ${uniqueUrls.length} unique source video(s) for ${clips.length} clips`);
+    // PHASE 1: Download each unique source video ONCE (was N times!).
+    // Clips now arrive as bare storage PATHS; mint a fresh signed URL per
+    // unique path right before downloading. sourceMap stays keyed by PATH
+    // (signed URLs differ per mint, so they can't be dedupe keys).
+    const uniquePaths = [...new Set(clips.map(c => c.url))];
+    console.log(`[${jobId}] Downloading ${uniquePaths.length} unique source video(s) for ${clips.length} clips`);
     jobs[jobId].stage = 'downloading';
 
     const sourceMap = {};
-    for (let i = 0; i < uniqueUrls.length; i++) {
-      const url = uniqueUrls[i];
+    for (let i = 0; i < uniquePaths.length; i++) {
+      const path = uniquePaths[i];
       const sourcePath = `${tmpDir}/source_${i}.mp4`;
       jobs[jobId].phaseItem = i + 1;
-      jobs[jobId].phaseTotal = uniqueUrls.length;
-      jobs[jobId].label = `Downloading source ${i + 1} of ${uniqueUrls.length}...`;
-      console.log(`[${jobId}] Downloading source ${i + 1}/${uniqueUrls.length}`);
-      await downloadFile(url, sourcePath);
-      sourceMap[url] = sourcePath;
+      jobs[jobId].phaseTotal = uniquePaths.length;
+      jobs[jobId].label = `Downloading source ${i + 1} of ${uniquePaths.length}...`;
+      console.log(`[${jobId}] Downloading source ${i + 1}/${uniquePaths.length}`);
+      const signedUrl = await signObjectUrl(supabase, path, SOURCE_URL_TTL_SECONDS);
+      await downloadFile(signedUrl, sourcePath);
+      sourceMap[path] = sourcePath;
       const stats = fs.statSync(sourcePath);
       console.log(`[${jobId}] Source ${i + 1} downloaded: ${(stats.size / 1024 / 1024).toFixed(0)} MB`);
-      jobs[jobId].progress = Math.round(((i + 1) / uniqueUrls.length) * 50);
+      jobs[jobId].progress = Math.round(((i + 1) / uniquePaths.length) * 50);
     }
 
     // PHASE 2: Trim each clip from its (already downloaded) source
@@ -136,13 +147,22 @@ async function processExport(jobId, clips, outputFileName) {
       return;
     }
 
-    const { data: urlData } = supabase.storage.from('Videos').getPublicUrl(fileName);
+    // Deliver the rendered reel via a signed URL — the bucket is private now.
+    const { data: signedData, error: signError } = await supabase.storage
+      .from('Videos')
+      .createSignedUrl(fileName, OUTPUT_URL_TTL_SECONDS);
+    if (signError || !signedData) {
+      console.error(`[${jobId}] Output sign error:`, signError);
+      jobs[jobId].status = 'failed';
+      jobs[jobId].error = `Could not sign output: ${signError?.message ?? 'no data'}`;
+      return;
+    }
     jobs[jobId].status = 'done';
-    jobs[jobId].url = urlData.publicUrl;
+    jobs[jobId].url = signedData.signedUrl;
     jobs[jobId].progress = 100;
     jobs[jobId].stage = 'done';
     jobs[jobId].label = 'Complete!';
-    console.log(`[${jobId}] Export complete: ${urlData.publicUrl}`);
+    console.log(`[${jobId}] Export complete: ${signedData.signedUrl}`);
 
   } catch (error) {
     console.error(`[${jobId}] Export failed at stage "${jobs[jobId].stage}":`, error.message);
@@ -151,6 +171,19 @@ async function processExport(jobId, clips, outputFileName) {
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
   }
+}
+
+// Mint a short-lived signed URL for a private-bucket object key, using the
+// service-role client. Throws on failure so the caller's try/catch marks the
+// job failed (consistent with how source-download errors propagate).
+async function signObjectUrl(supabase, key, expiresInSeconds) {
+  const { data, error } = await supabase.storage
+    .from('Videos')
+    .createSignedUrl(key, expiresInSeconds);
+  if (error || !data) {
+    throw new Error(`Failed to sign '${key}': ${error?.message ?? 'no data'}`);
+  }
+  return data.signedUrl;
 }
 
 function downloadFile(url, dest) {
