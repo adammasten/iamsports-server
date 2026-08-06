@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const axios = require('axios');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
@@ -56,6 +57,111 @@ app.get('/job/:jobId', (req, res) => {
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json(job);
 });
+
+// ── Faststart (web-optimize a raw game video) ────────────────────────────────
+// iPhone recordings put the MP4 index (moov atom) at the END of the file, so a
+// player can't start streaming until it fetches the whole thing — which is why
+// big games "won't play from the cloud" while a downloaded copy plays fine
+// (reels already stream because /export writes them with +faststart, line ~110).
+// This does the same lossless remux (-c copy, no re-encode, no quality loss),
+// moving the index to the front, and writes it BACK OVER THE SAME KEY so the
+// app's videos.url still points to it. Poll /job/:id like /export.
+//
+// Big-file safe: download streams to disk (downloadFile), and the upload streams
+// the file from disk via axios (NOT fs.readFileSync — a 4.75GB Buffer would OOM
+// the container the way /export's small-reel readFileSync never would).
+app.post('/faststart', async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (!key || typeof key !== 'string') {
+      return res.status(400).json({ error: 'No storage key provided' });
+    }
+    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    jobs[jobId] = {
+      status: 'processing', url: null, error: null, progress: 0,
+      stage: 'starting', phaseItem: null, phaseTotal: null,
+      label: 'Queued...', createdAt: Date.now(),
+    };
+    res.json({ jobId });
+    processFaststart(jobId, key);
+  } catch (e) {
+    console.error('Faststart endpoint error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function processFaststart(jobId, key) {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const tmpDir = `/tmp/fs_${jobId}`;
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const srcPath = `${tmpDir}/src.mp4`;
+  const outPath = `${tmpDir}/out.mp4`;
+  console.log(`[${jobId}] Faststart requested for ${key}`);
+
+  try {
+    // 1) Download the raw video to disk (streamed — memory-safe).
+    jobs[jobId].stage = 'downloading';
+    jobs[jobId].label = 'Downloading source...';
+    jobs[jobId].progress = 5;
+    const signedUrl = await signObjectUrl(supabase, key, SOURCE_URL_TTL_SECONDS);
+    await downloadFile(signedUrl, srcPath);
+    const inSize = fs.statSync(srcPath).size;
+    console.log(`[${jobId}] Downloaded ${(inSize / 1024 / 1024).toFixed(0)} MB`);
+
+    // 2) Lossless remux → moov atom to the front. -c copy = no re-encode, so
+    //    it's fast (disk-bound) and pixel-identical; only the layout changes.
+    jobs[jobId].stage = 'remuxing';
+    jobs[jobId].label = 'Web-optimizing (faststart)...';
+    jobs[jobId].progress = 45;
+    await execAsync(
+      `ffmpeg -i ${srcPath} -c copy -movflags +faststart -map 0 ${outPath} -y 2>&1`,
+      { maxBuffer: 10 * 1024 * 1024 },
+    );
+    const outSize = fs.statSync(outPath).size;
+    console.log(`[${jobId}] Remuxed → ${(outSize / 1024 / 1024).toFixed(0)} MB`);
+
+    // Free the source before the upload so peak /tmp usage is ~1 file, not 2.
+    try { fs.unlinkSync(srcPath); } catch (e) {}
+
+    // 3) Upload back OVER THE SAME KEY (x-upsert). Stream the file from disk with
+    //    axios (Content-Length set) so nothing loads the whole file into memory.
+    jobs[jobId].stage = 'uploading';
+    jobs[jobId].label = 'Saving web-optimized video...';
+    jobs[jobId].progress = 70;
+    const encodedKey = key.split('/').map(encodeURIComponent).join('/');
+    await axios.post(
+      `${SUPABASE_URL}/storage/v1/object/Videos/${encodedKey}`,
+      fs.createReadStream(outPath),
+      {
+        headers: {
+          Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+          apikey: SUPABASE_SERVICE_ROLE_KEY,
+          'Content-Type': 'video/mp4',
+          'x-upsert': 'true',
+          'Content-Length': outSize,
+          'Cache-Control': 'no-cache',
+        },
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+      },
+    );
+
+    jobs[jobId].status = 'done';
+    jobs[jobId].progress = 100;
+    jobs[jobId].stage = 'done';
+    jobs[jobId].label = 'Web-optimized!';
+    console.log(`[${jobId}] Faststart complete for ${key} (${(outSize / 1024 / 1024).toFixed(0)} MB)`);
+  } catch (error) {
+    const msg = error?.response
+      ? `HTTP ${error.response.status} ${JSON.stringify(error.response.data)}`
+      : error.message;
+    console.error(`[${jobId}] Faststart failed at "${jobs[jobId].stage}":`, msg);
+    jobs[jobId].status = 'failed';
+    jobs[jobId].error = `${jobs[jobId].stage || 'processing'}: ${msg}`;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
 
 async function processExport(jobId, clips, outputFileName) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
