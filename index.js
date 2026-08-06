@@ -22,7 +22,7 @@ const SOURCE_URL_TTL_SECONDS = 3600;   // 1 hour
 const OUTPUT_URL_TTL_SECONDS = 86400;  // 24 hours
 
 app.get('/', (req, res) => {
-  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v2' });
+  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v3' });
 });
 
 app.post('/export', async (req, res) => {
@@ -63,8 +63,9 @@ app.get('/job/:jobId', (req, res) => {
 // big games "won't play from the cloud" while a downloaded copy plays fine
 // (reels already stream because /export writes them with +faststart, line ~110).
 // This does the same lossless remux (-c copy, no re-encode, no quality loss),
-// moving the index to the front, and writes it BACK OVER THE SAME KEY so the
-// app's videos.url still points to it. Poll /job/:id like /export.
+// moving the index to the front, uploads it to a NEW key, repoints videos.url to
+// it, and deletes the old object (a fresh key avoids the overwrite 409 and never
+// risks the original). Poll /job/:id like /export.
 //
 // Big-file safe: download streams to disk (downloadFile), and the re-upload uses
 // Supabase's resumable (TUS) endpoint in 15MB chunks read from disk (NOT a
@@ -123,22 +124,45 @@ async function processFaststart(jobId, key) {
     // Free the source before the upload so peak /tmp usage is ~1 file, not 2.
     try { fs.unlinkSync(srcPath); } catch (e) {}
 
-    // 3) Upload back OVER THE SAME KEY via Supabase's RESUMABLE (TUS) endpoint.
-    //    A single POST of a multi-GB body gets reset by the gateway ('write
-    //    EPROTO'), so we chunk it the same way the app uploads games. Streams
-    //    chunks from disk (~15MB in memory at a time, not the whole 4.75GB).
+    // 3) Upload the faststarted file to a NEW key via Supabase's RESUMABLE (TUS)
+    //    endpoint. A fresh key avoids the overwrite conflict (TUS PATCH 409 "the
+    //    resource already exists" — upsert isn't honored the way the app never
+    //    needs, since it always writes new timestamped keys) AND is safe: the
+    //    original is never touched until the new object is up and the row is
+    //    switched over. (A single multi-GB POST gets reset — 'write EPROTO' — so
+    //    TUS chunks it, ~15MB in memory at a time, not the whole 4.75GB.)
     jobs[jobId].stage = 'uploading';
-    jobs[jobId].label = 'Saving web-optimized video...';
+    jobs[jobId].label = 'Uploading web-optimized video...';
     jobs[jobId].progress = 70;
-    await resumableUpload(outPath, key, outSize, (sent, total) => {
-      jobs[jobId].progress = 70 + Math.round((sent / total) * 29); // 70..99
+    const newKey = `${key.replace(/\.mp4$/i, '')}-fs${Date.now()}.mp4`;
+    await resumableUpload(outPath, newKey, outSize, (sent, total) => {
+      jobs[jobId].progress = 70 + Math.round((sent / total) * 27); // 70..97
     });
+
+    // 4) Repoint the video's DB row to the faststarted object (service role
+    //    bypasses RLS). Nothing else references the storage key — clips join on
+    //    video_id, shares on content_id — so only videos.url needs switching.
+    jobs[jobId].stage = 'saving';
+    jobs[jobId].label = 'Switching to web-optimized version...';
+    jobs[jobId].progress = 98;
+    const { data: updated, error: dbErr } = await supabase
+      .from('videos').update({ url: newKey, upload_bytes: outSize }).eq('url', key).select('id');
+    if (dbErr) throw new Error(`DB repoint failed: ${dbErr.message}`);
+    if (!updated || updated.length === 0) throw new Error(`No videos row found with url=${key}`);
+
+    // 5) Delete the old (non-faststart) object — safe now that the row points at
+    //    the new one. Non-fatal if it fails (just leaves an orphan to clean later).
+    try {
+      await supabase.storage.from('Videos').remove([key]);
+    } catch (e) {
+      console.warn(`[${jobId}] old-object cleanup failed (non-fatal):`, e.message);
+    }
 
     jobs[jobId].status = 'done';
     jobs[jobId].progress = 100;
     jobs[jobId].stage = 'done';
     jobs[jobId].label = 'Web-optimized!';
-    console.log(`[${jobId}] Faststart complete for ${key} (${(outSize / 1024 / 1024).toFixed(0)} MB)`);
+    console.log(`[${jobId}] Faststart complete: ${key} -> ${newKey} (${(outSize / 1024 / 1024).toFixed(0)} MB, ${updated.length} row(s) repointed)`);
   } catch (error) {
     const msg = error?.response
       ? `HTTP ${error.response.status} ${JSON.stringify(error.response.data)}`
