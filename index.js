@@ -22,7 +22,7 @@ const SOURCE_URL_TTL_SECONDS = 3600;   // 1 hour
 const OUTPUT_URL_TTL_SECONDS = 86400;  // 24 hours
 
 app.get('/', (req, res) => {
-  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v3' });
+  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v3', optimize: 'v1' });
 });
 
 app.post('/export', async (req, res) => {
@@ -90,6 +90,108 @@ app.post('/faststart', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ── Optimize (transcode raw game video → streamable 720p H.264) ───────────────
+// Faststart alone wasn't enough: iPhone games are HEVC (often HDR), which the
+// in-app player stalls/blacks on, and at 4.75GB they stream poorly. This makes a
+// small, universally-playable copy WITHOUT destroying the master:
+//   1. download the current file (videos.url = the full-quality master)
+//   2. transcode → 720p H.264 (yuv420p / SDR-safe), faststart
+//   3. upload the small copy to a NEW key
+//   4. videos.original_url := old url (master, kept), videos.url := new key
+// Playback then uses videos.url (the small copy) with no app change; the master
+// stays in original_url for full-quality download/export. Nothing is deleted.
+// Poll /job/:id. Requires the videos.original_url column to exist.
+app.post('/optimize', async (req, res) => {
+  try {
+    const { key } = req.body;
+    if (!key || typeof key !== 'string') {
+      return res.status(400).json({ error: 'No storage key provided' });
+    }
+    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    jobs[jobId] = {
+      status: 'processing', url: null, error: null, progress: 0,
+      stage: 'starting', phaseItem: null, phaseTotal: null,
+      label: 'Queued...', createdAt: Date.now(),
+    };
+    res.json({ jobId });
+    processOptimize(jobId, key);
+  } catch (e) {
+    console.error('Optimize endpoint error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function processOptimize(jobId, key) {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const tmpDir = `/tmp/opt_${jobId}`;
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const srcPath = `${tmpDir}/src.mp4`;
+  const outPath = `${tmpDir}/out.mp4`;
+  console.log(`[${jobId}] Optimize requested for ${key}`);
+
+  try {
+    // 1) Download the master (videos.url) to disk (streamed — memory-safe).
+    jobs[jobId].stage = 'downloading';
+    jobs[jobId].label = 'Downloading source...';
+    jobs[jobId].progress = 5;
+    const signedUrl = await signObjectUrl(supabase, key, SOURCE_URL_TTL_SECONDS);
+    await downloadFile(signedUrl, srcPath);
+    console.log(`[${jobId}] Downloaded ${(fs.statSync(srcPath).size / 1024 / 1024).toFixed(0)} MB`);
+
+    // 2) Transcode → 720p H.264, 8-bit yuv420p (universally decodable), faststart.
+    //    -map 0:v:0 -map 0:a? keeps first video + audio, drops timed-metadata
+    //    tracks. Real re-encode (slow, CPU-bound) — the price of "plays anywhere".
+    jobs[jobId].stage = 'transcoding';
+    jobs[jobId].label = 'Transcoding to 720p H.264 (this takes a while)...';
+    jobs[jobId].progress = 20;
+    await execAsync(
+      `ffmpeg -i ${srcPath} -map 0:v:0 -map 0:a? ` +
+      `-vf "scale=1280:720:force_original_aspect_ratio=decrease,format=yuv420p" ` +
+      `-c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k -movflags +faststart ${outPath} -y 2>&1`,
+      { maxBuffer: 10 * 1024 * 1024 },
+    );
+    const outSize = fs.statSync(outPath).size;
+    console.log(`[${jobId}] Transcoded → ${(outSize / 1024 / 1024).toFixed(0)} MB`);
+    try { fs.unlinkSync(srcPath); } catch (e) {}
+
+    // 3) Upload the small copy to a NEW key (resumable/TUS, memory-safe).
+    jobs[jobId].stage = 'uploading';
+    jobs[jobId].label = 'Uploading streaming copy...';
+    jobs[jobId].progress = 70;
+    const newKey = `${key.replace(/\.mp4$/i, '')}-720${Date.now()}.mp4`;
+    await resumableUpload(outPath, newKey, outSize, (sent, total) => {
+      jobs[jobId].progress = 70 + Math.round((sent / total) * 27); // 70..97
+    });
+
+    // 4) Keep the master in original_url, point playback (url) at the small copy.
+    //    Only videos.url is used for playback (no app change); original_url holds
+    //    the master for full-quality download/export. The master file is NOT
+    //    deleted.
+    jobs[jobId].stage = 'saving';
+    jobs[jobId].label = 'Switching playback to the streaming copy...';
+    jobs[jobId].progress = 98;
+    const { data: updated, error: dbErr } = await supabase
+      .from('videos')
+      .update({ original_url: key, url: newKey, upload_bytes: outSize })
+      .eq('url', key)
+      .select('id');
+    if (dbErr) throw new Error(`DB repoint failed: ${dbErr.message}`);
+    if (!updated || updated.length === 0) throw new Error(`No videos row found with url=${key}`);
+
+    jobs[jobId].status = 'done';
+    jobs[jobId].progress = 100;
+    jobs[jobId].stage = 'done';
+    jobs[jobId].label = 'Optimized!';
+    console.log(`[${jobId}] Optimize complete: play ${newKey}, master kept at ${key} (${updated.length} row(s))`);
+  } catch (error) {
+    console.error(`[${jobId}] Optimize failed at "${jobs[jobId].stage}":`, error.message);
+    jobs[jobId].status = 'failed';
+    jobs[jobId].error = `${jobs[jobId].stage || 'processing'}: ${error.message}`;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
 
 async function processFaststart(jobId, key) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
