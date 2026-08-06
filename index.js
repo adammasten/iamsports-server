@@ -1,6 +1,5 @@
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
@@ -23,7 +22,7 @@ const SOURCE_URL_TTL_SECONDS = 3600;   // 1 hour
 const OUTPUT_URL_TTL_SECONDS = 86400;  // 24 hours
 
 app.get('/', (req, res) => {
-  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL });
+  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v2' });
 });
 
 app.post('/export', async (req, res) => {
@@ -67,9 +66,10 @@ app.get('/job/:jobId', (req, res) => {
 // moving the index to the front, and writes it BACK OVER THE SAME KEY so the
 // app's videos.url still points to it. Poll /job/:id like /export.
 //
-// Big-file safe: download streams to disk (downloadFile), and the upload streams
-// the file from disk via axios (NOT fs.readFileSync — a 4.75GB Buffer would OOM
-// the container the way /export's small-reel readFileSync never would).
+// Big-file safe: download streams to disk (downloadFile), and the re-upload uses
+// Supabase's resumable (TUS) endpoint in 15MB chunks read from disk (NOT a
+// single POST / fs.readFileSync — a multi-GB body gets reset by the gateway
+// with 'write EPROTO', and a 4.75GB Buffer would OOM the container).
 app.post('/faststart', async (req, res) => {
   try {
     const { key } = req.body;
@@ -123,28 +123,16 @@ async function processFaststart(jobId, key) {
     // Free the source before the upload so peak /tmp usage is ~1 file, not 2.
     try { fs.unlinkSync(srcPath); } catch (e) {}
 
-    // 3) Upload back OVER THE SAME KEY (x-upsert). Stream the file from disk with
-    //    axios (Content-Length set) so nothing loads the whole file into memory.
+    // 3) Upload back OVER THE SAME KEY via Supabase's RESUMABLE (TUS) endpoint.
+    //    A single POST of a multi-GB body gets reset by the gateway ('write
+    //    EPROTO'), so we chunk it the same way the app uploads games. Streams
+    //    chunks from disk (~15MB in memory at a time, not the whole 4.75GB).
     jobs[jobId].stage = 'uploading';
     jobs[jobId].label = 'Saving web-optimized video...';
     jobs[jobId].progress = 70;
-    const encodedKey = key.split('/').map(encodeURIComponent).join('/');
-    await axios.post(
-      `${SUPABASE_URL}/storage/v1/object/Videos/${encodedKey}`,
-      fs.createReadStream(outPath),
-      {
-        headers: {
-          Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-          apikey: SUPABASE_SERVICE_ROLE_KEY,
-          'Content-Type': 'video/mp4',
-          'x-upsert': 'true',
-          'Content-Length': outSize,
-          'Cache-Control': 'no-cache',
-        },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
-      },
-    );
+    await resumableUpload(outPath, key, outSize, (sent, total) => {
+      jobs[jobId].progress = 70 + Math.round((sent / total) * 29); // 70..99
+    });
 
     jobs[jobId].status = 'done';
     jobs[jobId].progress = 100;
@@ -290,6 +278,75 @@ async function signObjectUrl(supabase, key, expiresInSeconds) {
     throw new Error(`Failed to sign '${key}': ${error?.message ?? 'no data'}`);
   }
   return data.signedUrl;
+}
+
+// Upload a local file to the Videos bucket via Supabase's RESUMABLE (TUS)
+// endpoint, overwriting objectKey. Supabase's standard upload rejects/reset a
+// multi-GB single request; TUS chunks it (same protocol the app uses to upload
+// games). Reads ~15MB at a time from disk — never the whole file into memory.
+// Auth is the service-role key. onProgress(sentBytes, totalBytes) is optional.
+async function resumableUpload(filePath, objectKey, size, onProgress) {
+  const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
+  const authHeaders = {
+    authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+    apikey: SUPABASE_SERVICE_ROLE_KEY,
+  };
+
+  // Create the upload session → server returns the chunk-PATCH URL in Location.
+  const createResp = await fetch(`${SUPABASE_URL}/storage/v1/upload/resumable`, {
+    method: 'POST',
+    headers: {
+      ...authHeaders,
+      'x-upsert': 'true',
+      'Tus-Resumable': '1.0.0',
+      'Upload-Length': String(size),
+      'Upload-Metadata': [
+        `bucketName ${b64('Videos')}`,
+        `objectName ${b64(objectKey)}`,
+        `contentType ${b64('video/mp4')}`,
+        `cacheControl ${b64('3600')}`,
+      ].join(','),
+    },
+  });
+  if (!createResp.ok) {
+    throw new Error(`TUS create ${createResp.status}: ${(await createResp.text()).slice(0, 300)}`);
+  }
+  let uploadUrl = createResp.headers.get('location');
+  if (!uploadUrl) throw new Error('TUS create returned no Location header');
+  if (!/^https?:\/\//.test(uploadUrl)) {
+    uploadUrl = `${SUPABASE_URL}${uploadUrl.startsWith('/') ? '' : '/'}${uploadUrl}`;
+  }
+
+  // PATCH 15MB chunks, adopting the server's Upload-Offset each time.
+  const CHUNK = 15 * 1024 * 1024; // 15MB — proven chunk size for Supabase (matches the app)
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(CHUNK);
+    let offset = 0;
+    while (offset < size) {
+      const want = Math.min(CHUNK, size - offset);
+      const read = fs.readSync(fd, buf, 0, want, offset);
+      const resp = await fetch(uploadUrl, {
+        method: 'PATCH',
+        headers: {
+          ...authHeaders,
+          'Tus-Resumable': '1.0.0',
+          'Upload-Offset': String(offset),
+          'Content-Type': 'application/offset+octet-stream',
+        },
+        body: buf.subarray(0, read),
+      });
+      if (!resp.ok && resp.status !== 204) {
+        throw new Error(`TUS PATCH ${resp.status} at ${offset}: ${(await resp.text()).slice(0, 200)}`);
+      }
+      const raw = resp.headers.get('upload-offset');
+      const srv = raw != null ? parseInt(raw, 10) : NaN;
+      offset = Number.isFinite(srv) ? srv : offset + read;
+      if (typeof onProgress === 'function') onProgress(offset, size);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function downloadFile(url, dest) {
