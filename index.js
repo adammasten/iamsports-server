@@ -22,7 +22,7 @@ const SOURCE_URL_TTL_SECONDS = 3600;   // 1 hour
 const OUTPUT_URL_TTL_SECONDS = 86400;  // 24 hours
 
 app.get('/', (req, res) => {
-  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v3', optimize: 'v1' });
+  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v3', optimize: 'v2' });
 });
 
 app.post('/export', async (req, res) => {
@@ -121,6 +121,66 @@ app.post('/optimize', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// Batch: optimize every video not yet optimized (original_url is null), one at a
+// time (sequential — never two CPU-heavy transcodes at once). Idempotent: a
+// re-run only picks up whatever's still pending, so it's safe to fire again if it
+// gets interrupted. Poll /job/:id for phaseItem/phaseTotal progress.
+app.post('/optimize-all', async (req, res) => {
+  try {
+    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    jobs[jobId] = {
+      status: 'processing', url: null, error: null, progress: 0,
+      stage: 'listing', phaseItem: null, phaseTotal: null,
+      label: 'Finding videos to optimize...', createdAt: Date.now(),
+    };
+    res.json({ jobId });
+    processOptimizeAll(jobId);
+  } catch (e) {
+    console.error('Optimize-all endpoint error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function processOptimizeAll(jobId) {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  try {
+    const { data: pending, error } = await supabase
+      .from('videos').select('url, label').is('original_url', null).order('created_at');
+    if (error) throw new Error(`list failed: ${error.message}`);
+    const list = (pending || []).filter(v => v.url);
+    jobs[jobId].phaseTotal = list.length;
+    jobs[jobId].stage = 'optimizing';
+    console.log(`[${jobId}] optimize-all: ${list.length} pending`);
+    if (list.length === 0) {
+      jobs[jobId].status = 'done'; jobs[jobId].progress = 100; jobs[jobId].label = 'Nothing to optimize';
+      return;
+    }
+    let done = 0, failed = 0; const failures = [];
+    for (let i = 0; i < list.length; i++) {
+      const v = list[i];
+      jobs[jobId].phaseItem = i + 1;
+      jobs[jobId].progress = Math.round((i / list.length) * 100);
+      jobs[jobId].label = `Optimizing ${i + 1}/${list.length}: ${v.label || v.url}`;
+      const subId = `${jobId}-${i}`;
+      jobs[subId] = { status: 'processing', stage: 'starting', progress: 0, error: null, createdAt: Date.now() };
+      try { await processOptimize(subId, v.url); } catch (e) { /* processOptimize handles its own errors */ }
+      if (jobs[subId] && jobs[subId].status === 'done') done++;
+      else { failed++; failures.push(`${v.label || v.url}: ${jobs[subId] && jobs[subId].error || 'unknown'}`); }
+      delete jobs[subId];
+      if (!jobs[jobId]) return; // batch job was TTL-cleaned (very long run) — stop gracefully; re-run continues
+    }
+    jobs[jobId].status = failed === 0 ? 'done' : 'partial';
+    jobs[jobId].progress = 100;
+    jobs[jobId].stage = 'done';
+    jobs[jobId].label = `Optimized ${done}/${list.length}${failed ? ` (${failed} failed)` : ''}`;
+    jobs[jobId].error = failures.length ? failures.join(' | ') : null;
+    console.log(`[${jobId}] optimize-all done: ${done} ok, ${failed} failed`);
+  } catch (e) {
+    if (jobs[jobId]) { jobs[jobId].status = 'failed'; jobs[jobId].error = e.message; }
+    console.error(`[${jobId}] optimize-all failed:`, e.message);
+  }
+}
 
 async function processOptimize(jobId, key) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
