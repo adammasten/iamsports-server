@@ -182,6 +182,97 @@ async function processOptimizeAll(jobId) {
   }
 }
 
+// Batch: backfill a poster thumbnail for every video MISSING one (thumbnail_path
+// is null). Independent of optimize — this fills the EXISTING library (rows that
+// were optimized before the thumbnail step existed, which /optimize-all skips
+// because their original_url is already set). Grabs a frame from each video's
+// current url (the small 720p copy for optimized rows), uploads thumbnails/<id>.jpg,
+// sets thumbnail_path. Sequential + idempotent (a re-run only picks up whatever's
+// still null). Poll /job/:id for phaseItem/phaseTotal.
+app.post('/thumbnails-backfill', async (req, res) => {
+  try {
+    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    jobs[jobId] = {
+      status: 'processing', url: null, error: null, progress: 0,
+      stage: 'listing', phaseItem: null, phaseTotal: null,
+      label: 'Finding videos without a thumbnail...', createdAt: Date.now(),
+    };
+    res.json({ jobId });
+    processThumbnailBackfill(jobId);
+  } catch (e) {
+    console.error('Thumbnails-backfill endpoint error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function processThumbnailBackfill(jobId) {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  try {
+    const { data: pending, error } = await supabase
+      .from('videos').select('id, url, label').is('thumbnail_path', null).order('created_at');
+    if (error) throw new Error(`list failed: ${error.message}`);
+    const list = (pending || []).filter(v => v.url);
+    jobs[jobId].phaseTotal = list.length;
+    jobs[jobId].stage = 'thumbnailing';
+    console.log(`[${jobId}] thumbnails-backfill: ${list.length} missing`);
+    if (list.length === 0) {
+      jobs[jobId].status = 'done'; jobs[jobId].progress = 100; jobs[jobId].label = 'Every video already has a thumbnail';
+      return;
+    }
+    let done = 0, failed = 0; const failures = [];
+    for (let i = 0; i < list.length; i++) {
+      const v = list[i];
+      jobs[jobId].phaseItem = i + 1;
+      jobs[jobId].progress = Math.round((i / list.length) * 100);
+      jobs[jobId].label = `Thumbnailing ${i + 1}/${list.length}: ${v.label || v.url}`;
+      try {
+        await generateThumbnail(supabase, jobId, v.id, v.url);
+        done++;
+      } catch (e) {
+        failed++; failures.push(`${v.label || v.url}: ${e.message}`);
+        console.warn(`[${jobId}] thumbnail failed for ${v.url}: ${e.message}`);
+      }
+      if (!jobs[jobId]) return; // TTL-cleaned on a very long run — stop; a re-run continues
+    }
+    jobs[jobId].status = failed === 0 ? 'done' : 'partial';
+    jobs[jobId].progress = 100;
+    jobs[jobId].stage = 'done';
+    jobs[jobId].label = `Thumbnailed ${done}/${list.length}${failed ? ` (${failed} failed)` : ''}`;
+    jobs[jobId].error = failures.length ? failures.join(' | ') : null;
+    console.log(`[${jobId}] thumbnails-backfill done: ${done} ok, ${failed} failed`);
+  } catch (e) {
+    if (jobs[jobId]) { jobs[jobId].status = 'failed'; jobs[jobId].error = e.message; }
+    console.error(`[${jobId}] thumbnails-backfill failed:`, e.message);
+  }
+}
+
+// Download a video's current playback file, grab a representative frame (skipping
+// the black camera-start), upload thumbnails/<id>.jpg, set videos.thumbnail_path.
+// Throws on failure so the batch can count it; cleans its tmp dir either way.
+async function generateThumbnail(supabase, jobId, videoId, key) {
+  const tmpDir = `/tmp/thumb_${jobId}_${videoId}`;
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const srcPath = `${tmpDir}/src.mp4`;
+  const thumbPath = `${tmpDir}/thumb.jpg`;
+  try {
+    const signedUrl = await signObjectUrl(supabase, key, SOURCE_URL_TTL_SECONDS);
+    await downloadFile(signedUrl, srcPath);
+    await execAsync(
+      `ffmpeg -ss 1 -i ${srcPath} -vf "thumbnail=100,scale=640:-2" -frames:v 1 -q:v 3 ${thumbPath} -y 2>&1`,
+      { maxBuffer: 4 * 1024 * 1024 },
+    );
+    const thumbKey = `thumbnails/${videoId}.jpg`;
+    const buf = fs.readFileSync(thumbPath);
+    const { error: upErr } = await supabase.storage.from('Videos').upload(thumbKey, buf, { contentType: 'image/jpeg', upsert: true });
+    if (upErr) throw upErr;
+    const { error: dbErr } = await supabase.from('videos').update({ thumbnail_path: thumbKey }).eq('id', videoId);
+    if (dbErr) throw new Error(`DB set failed: ${dbErr.message}`);
+    console.log(`[${jobId}] Thumbnail set: ${thumbKey}`);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
 async function processOptimize(jobId, key) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   const tmpDir = `/tmp/opt_${jobId}`;
