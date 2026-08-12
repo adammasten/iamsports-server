@@ -273,6 +273,106 @@ async function generateThumbnail(supabase, jobId, videoId, key) {
   }
 }
 
+// ── Reel thumbnails ─────────────────────────────────────────────────────────
+// Reels are rendered by /export (not optimized), so they need their own poster
+// step. Same idea as videos: grab a frame from the reel mp4, upload
+// reel-thumbnails/<reelId>.jpg, set highlight_reels.thumbnail_path. Keyed by reel
+// id so sign-media can authorize via authorize_reel_playback. Reels open on real
+// play content (no black camera-start), so no -ss skip.
+async function generateReelThumbnail(supabase, jobId, reelId, key) {
+  const tmpDir = `/tmp/rthumb_${jobId}_${reelId}`;
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const srcPath = `${tmpDir}/src.mp4`;
+  const thumbPath = `${tmpDir}/thumb.jpg`;
+  try {
+    const signedUrl = await signObjectUrl(supabase, key, SOURCE_URL_TTL_SECONDS);
+    await downloadFile(signedUrl, srcPath);
+    await execAsync(
+      `ffmpeg -i ${srcPath} -vf "thumbnail=100,scale=640:-2" -frames:v 1 -q:v 3 ${thumbPath} -y 2>&1`,
+      { maxBuffer: 4 * 1024 * 1024 },
+    );
+    const thumbKey = `reel-thumbnails/${reelId}.jpg`;
+    const buf = fs.readFileSync(thumbPath);
+    const { error: upErr } = await supabase.storage.from('Videos').upload(thumbKey, buf, { contentType: 'image/jpeg', upsert: true });
+    if (upErr) throw upErr;
+    const { error: dbErr } = await supabase.from('highlight_reels').update({ thumbnail_path: thumbKey }).eq('id', reelId);
+    if (dbErr) throw new Error(`DB set failed: ${dbErr.message}`);
+    console.log(`[${jobId}] Reel thumbnail set: ${thumbKey}`);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+// Fire-and-forget single reel thumbnail — the client calls this right after it
+// creates a reel row. Best-effort: a failure just leaves the placeholder.
+app.post('/reel-thumbnail', async (req, res) => {
+  const { reelId } = req.body || {};
+  if (!reelId) return res.status(400).json({ error: 'reelId required' });
+  res.json({ ok: true });
+  const jobId = `reelthumb_${reelId}`;
+  try {
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+    const { data: reel, error } = await supabase.from('highlight_reels').select('storage_path').eq('id', reelId).maybeSingle();
+    if (error || !reel?.storage_path) { console.warn(`[${jobId}] reel not found / no storage_path`); return; }
+    await generateReelThumbnail(supabase, jobId, reelId, reel.storage_path);
+  } catch (e) {
+    console.warn(`[${jobId}] reel thumbnail failed (non-fatal): ${e.message}`);
+  }
+});
+
+// Batch: backfill a poster for every reel missing one. Poll /job/:id.
+app.post('/reel-thumbnails-backfill', async (req, res) => {
+  try {
+    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    jobs[jobId] = {
+      status: 'processing', url: null, error: null, progress: 0,
+      stage: 'listing', phaseItem: null, phaseTotal: null,
+      label: 'Finding reels without a thumbnail...', createdAt: Date.now(),
+    };
+    res.json({ jobId });
+    processReelThumbnailBackfill(jobId);
+  } catch (e) {
+    console.error('Reel-thumbnails-backfill endpoint error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function processReelThumbnailBackfill(jobId) {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  try {
+    const { data: pending, error } = await supabase
+      .from('highlight_reels').select('id, storage_path, name').is('thumbnail_path', null).order('created_at');
+    if (error) throw new Error(`list failed: ${error.message}`);
+    const list = (pending || []).filter(r => r.storage_path);
+    jobs[jobId].phaseTotal = list.length;
+    jobs[jobId].stage = 'thumbnailing';
+    console.log(`[${jobId}] reel-thumbnails-backfill: ${list.length} missing`);
+    if (list.length === 0) {
+      jobs[jobId].status = 'done'; jobs[jobId].progress = 100; jobs[jobId].label = 'Every reel already has a thumbnail';
+      return;
+    }
+    let done = 0, failed = 0; const failures = [];
+    for (let i = 0; i < list.length; i++) {
+      const r = list[i];
+      jobs[jobId].phaseItem = i + 1;
+      jobs[jobId].progress = Math.round((i / list.length) * 100);
+      jobs[jobId].label = `Thumbnailing reel ${i + 1}/${list.length}: ${r.name || r.id}`;
+      try { await generateReelThumbnail(supabase, jobId, r.id, r.storage_path); done++; }
+      catch (e) { failed++; failures.push(`${r.name || r.id}: ${e.message}`); console.warn(`[${jobId}] reel thumb failed for ${r.id}: ${e.message}`); }
+      if (!jobs[jobId]) return;
+    }
+    jobs[jobId].status = failed === 0 ? 'done' : 'partial';
+    jobs[jobId].progress = 100;
+    jobs[jobId].stage = 'done';
+    jobs[jobId].label = `Thumbnailed ${done}/${list.length}${failed ? ` (${failed} failed)` : ''}`;
+    jobs[jobId].error = failures.length ? failures.join(' | ') : null;
+    console.log(`[${jobId}] reel-thumbnails-backfill done: ${done} ok, ${failed} failed`);
+  } catch (e) {
+    if (jobs[jobId]) { jobs[jobId].status = 'failed'; jobs[jobId].error = e.message; }
+    console.error(`[${jobId}] reel-thumbnails-backfill failed:`, e.message);
+  }
+}
+
 async function processOptimize(jobId, key) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
   const tmpDir = `/tmp/opt_${jobId}`;
