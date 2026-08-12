@@ -239,6 +239,29 @@ async function processOptimize(jobId, key) {
     if (dbErr) throw new Error(`DB repoint failed: ${dbErr.message}`);
     if (!updated || updated.length === 0) throw new Error(`No videos row found with url=${key}`);
 
+    // 5) BEST-EFFORT poster thumbnail from the 720p copy. The `thumbnail` filter
+    //    picks a representative frame (skips black/blur); -ss 1 skips the black
+    //    camera-start. Wrapped so a failure here NEVER fails the optimize — the
+    //    video is already repointed/done; a missing thumbnail just falls back to
+    //    the card placeholder. Keyed by video id so sign-media can authorize it
+    //    via the parent video (thumbnails/<id>.jpg).
+    try {
+      const videoId = updated[0].id;
+      const thumbPath = `${tmpDir}/thumb.jpg`;
+      await execAsync(
+        `ffmpeg -ss 1 -i ${outPath} -vf "thumbnail=100,scale=640:-2" -frames:v 1 -q:v 3 ${thumbPath} -y 2>&1`,
+        { maxBuffer: 4 * 1024 * 1024 },
+      );
+      const thumbKey = `thumbnails/${videoId}.jpg`;
+      const buf = fs.readFileSync(thumbPath);
+      const { error: upErr } = await supabase.storage.from('Videos').upload(thumbKey, buf, { contentType: 'image/jpeg', upsert: true });
+      if (upErr) throw upErr;
+      await supabase.from('videos').update({ thumbnail_path: thumbKey }).eq('id', videoId);
+      console.log(`[${jobId}] Thumbnail set: ${thumbKey}`);
+    } catch (e) {
+      console.warn(`[${jobId}] Thumbnail step skipped (non-fatal): ${e.message}`);
+    }
+
     jobs[jobId].status = 'done';
     jobs[jobId].progress = 100;
     jobs[jobId].stage = 'done';
