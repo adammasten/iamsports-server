@@ -61,7 +61,8 @@ app.get('/job/:jobId', (req, res) => {
 // iPhone recordings put the MP4 index (moov atom) at the END of the file, so a
 // player can't start streaming until it fetches the whole thing — which is why
 // big games "won't play from the cloud" while a downloaded copy plays fine
-// (reels already stream because /export writes them with +faststart, line ~110).
+// (reels now stream on web too: the /export concat includes +faststart; run
+//  /reel-faststart-backfill once to fix reels rendered before that.)
 // This does the same lossless remux (-c copy, no re-encode, no quality loss),
 // moving the index to the front, uploads it to a NEW key, repoints videos.url to
 // it, and deletes the old object (a fresh key avoids the overwrite 409 and never
@@ -300,6 +301,79 @@ async function generateReelThumbnail(supabase, jobId, reelId, key) {
     console.log(`[${jobId}] Reel thumbnail set: ${thumbKey}`);
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+// ── Reel faststart backfill ─────────────────────────────────────────────────
+// Reels rendered before the /export concat learned +faststart have their moov
+// index at the END, so browsers can't stream them (they play on native, not web).
+// Re-mux each with faststart (-c copy, no re-encode) and repoint storage_path.
+// shares reference the reel id and resolve storage_path live, so the repoint is safe.
+async function faststartReel(supabase, jobId, reelId, key) {
+  const tmpDir = `/tmp/rfs_${jobId}_${reelId}`;
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const srcPath = `${tmpDir}/src.mp4`;
+  const outPath = `${tmpDir}/out.mp4`;
+  try {
+    const signedUrl = await signObjectUrl(supabase, key, SOURCE_URL_TTL_SECONDS);
+    await downloadFile(signedUrl, srcPath);
+    await execAsync(`ffmpeg -i ${srcPath} -c copy -movflags +faststart -map 0 ${outPath} -y 2>&1`, { maxBuffer: 10 * 1024 * 1024 });
+    const outSize = fs.statSync(outPath).size;
+    const newKey = `${key.replace(/\.mp4$/i, '')}-fs${Date.now()}.mp4`;
+    await resumableUpload(outPath, newKey, outSize, () => {});
+    const { error: dbErr } = await supabase.from('highlight_reels').update({ storage_path: newKey }).eq('id', reelId);
+    if (dbErr) throw new Error(`DB repoint failed: ${dbErr.message}`);
+    try { await supabase.storage.from('Videos').remove([key]); } catch (e) {}
+    console.log(`[${jobId}] Reel faststart: ${key} -> ${newKey}`);
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+app.post('/reel-faststart-backfill', async (req, res) => {
+  try {
+    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    jobs[jobId] = {
+      status: 'processing', url: null, error: null, progress: 0,
+      stage: 'listing', phaseItem: null, phaseTotal: null,
+      label: 'Finding reels to faststart...', createdAt: Date.now(),
+    };
+    res.json({ jobId });
+    processReelFaststartBackfill(jobId);
+  } catch (e) {
+    console.error('Reel-faststart-backfill endpoint error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+async function processReelFaststartBackfill(jobId) {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  try {
+    const { data: reels, error } = await supabase.from('highlight_reels').select('id, storage_path, name').order('created_at');
+    if (error) throw new Error(`list failed: ${error.message}`);
+    const list = (reels || []).filter(r => r.storage_path);
+    jobs[jobId].phaseTotal = list.length;
+    jobs[jobId].stage = 'faststarting';
+    console.log(`[${jobId}] reel-faststart-backfill: ${list.length} reels`);
+    if (list.length === 0) { jobs[jobId].status = 'done'; jobs[jobId].progress = 100; jobs[jobId].label = 'No reels'; return; }
+    let done = 0, failed = 0; const failures = [];
+    for (let i = 0; i < list.length; i++) {
+      const r = list[i];
+      jobs[jobId].phaseItem = i + 1;
+      jobs[jobId].progress = Math.round((i / list.length) * 100);
+      jobs[jobId].label = `Faststarting reel ${i + 1}/${list.length}: ${r.name || r.id}`;
+      try { await faststartReel(supabase, jobId, r.id, r.storage_path); done++; }
+      catch (e) { failed++; failures.push(`${r.name || r.id}: ${e.message}`); console.warn(`[${jobId}] reel faststart failed for ${r.id}: ${e.message}`); }
+      if (!jobs[jobId]) return;
+    }
+    jobs[jobId].status = failed === 0 ? 'done' : 'partial';
+    jobs[jobId].progress = 100; jobs[jobId].stage = 'done';
+    jobs[jobId].label = `Faststarted ${done}/${list.length}${failed ? ` (${failed} failed)` : ''}`;
+    jobs[jobId].error = failures.length ? failures.join(' | ') : null;
+    console.log(`[${jobId}] reel-faststart-backfill done: ${done} ok, ${failed} failed`);
+  } catch (e) {
+    if (jobs[jobId]) { jobs[jobId].status = 'failed'; jobs[jobId].error = e.message; }
+    console.error(`[${jobId}] reel-faststart-backfill failed:`, e.message);
   }
 }
 
@@ -621,7 +695,10 @@ async function processExport(jobId, clips, outputFileName) {
     fs.writeFileSync(concatFile, concatContent);
     const outputPath = `${tmpDir}/output.mp4`;
     console.log(`[${jobId}] Concatenating ${trimmedFiles.length} clips`);
-    await execAsync(`ffmpeg -f concat -safe 0 -i ${concatFile} -c copy ${outputPath} -y 2>&1`, { maxBuffer: 10 * 1024 * 1024 });
+    // +faststart moves the moov index atom to the FRONT so browsers can stream the
+    // reel on web (the per-clip faststart is lost by the -c copy concat otherwise).
+    // Still -c copy (no re-encode) — negligible cost, no quality change.
+    await execAsync(`ffmpeg -f concat -safe 0 -i ${concatFile} -c copy -movflags +faststart ${outputPath} -y 2>&1`, { maxBuffer: 10 * 1024 * 1024 });
 
     // PHASE 5: Upload final video to Supabase
     jobs[jobId].stage = 'uploading';
