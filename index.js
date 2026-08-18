@@ -673,7 +673,14 @@ async function processExport(jobId, clips, outputFileName) {
       // execAsync (not execSync) so the Node event loop keeps servicing /job/:id
       // status polls while ffmpeg runs in its child process. maxBuffer raised to
       // 10MB so ffmpeg's verbose stderr (redirected via 2>&1) doesn't overflow.
-      await execAsync(`ffmpeg -ss ${startTime} -i ${sourcePath} -t ${duration} -vf "fps=30,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1" -c:v libx264 -preset fast -crf 23 -c:a aac -ar 48000 -ac 2 -fps_mode cfr -async 1 -movflags +faststart ${trimmedPath} -y 2>&1`, { maxBuffer: 10 * 1024 * 1024 });
+      //
+      // QUALITY: the reel is a SECOND encode of already-720p-CRF-23 source clips, so
+      // these per-clip settings decide whether the reel looks as good as the source.
+      // preset medium + crf 18 = a visually-lossless second pass relative to the
+      // CRF-23 source, so the reel MATCHES the source instead of looking downgraded.
+      // Cost: modestly larger reel + a bit more render time; playback stays fast
+      // (short 720p clip, faststart preserved). Was: preset fast + crf 23 (visibly soft).
+      await execAsync(`ffmpeg -ss ${startTime} -i ${sourcePath} -t ${duration} -vf "fps=30,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1" -c:v libx264 -preset medium -crf 18 -c:a aac -ar 48000 -ac 2 -fps_mode cfr -async 1 -movflags +faststart ${trimmedPath} -y 2>&1`, { maxBuffer: 10 * 1024 * 1024 });
       trimmedFiles.push(trimmedPath);
       jobs[jobId].progress = 50 + Math.round(((i + 1) / clips.length) * 25);
     }
