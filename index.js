@@ -92,6 +92,43 @@ app.post('/faststart', async (req, res) => {
   }
 });
 
+// ── Concat game (stitch a game's videos into ONE downloadable file) ──────────
+// ADDITIVE — does not touch /export or any reel. Takes a game's video KEYS in
+// play order, NORMALIZES each to a uniform 720p H.264 profile (so a -c copy
+// concat is glitch-free even when quarters have mismatched codecs — raw HEVC and
+// already-optimized 720p mixed in one game), concatenates with +faststart,
+// uploads the result to a fresh game-downloads/ key, and returns a 24h signed
+// URL via /job/:id (exactly like /export). Nothing is repointed or deleted — the
+// source videos are never touched.
+//
+// Memory/disk safe: each source streams to disk (downloadFile), is normalized,
+// and the raw source is DELETED before the next download (peak disk = 1 raw +
+// N small 720p + output). The upload uses resumableUpload (15MB chunks from
+// disk) — no multi-GB Buffer / single POST, so a full game can't OOM the box.
+//
+// SPEED NOTE: this re-encodes each full video (the cost of one glitch-free file).
+// "Download all videos" stays the fast, no-re-encode path; this is the optional
+// single-file convenience.
+app.post('/concat-game', async (req, res) => {
+  try {
+    const { keys, outputFileName } = req.body;
+    if (!Array.isArray(keys) || keys.length === 0) {
+      return res.status(400).json({ error: 'No video keys provided' });
+    }
+    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    jobs[jobId] = {
+      status: 'processing', url: null, error: null, progress: 0,
+      stage: 'starting', phaseItem: null, phaseTotal: null,
+      label: 'Queued...', createdAt: Date.now(),
+    };
+    res.json({ jobId });
+    processConcatGame(jobId, keys, outputFileName);
+  } catch (e) {
+    console.error('Concat-game endpoint error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Optimize (transcode raw game video → streamable 720p H.264) ───────────────
 // Faststart alone wasn't enough: iPhone games are HEVC (often HDR), which the
 // in-app player stalls/blacks on, and at 4.75GB they stream poorly. This makes a
@@ -744,6 +781,95 @@ async function processExport(jobId, clips, outputFileName) {
 
   } catch (error) {
     console.error(`[${jobId}] Export failed at stage "${jobs[jobId].stage}":`, error.message);
+    jobs[jobId].status = 'failed';
+    jobs[jobId].error = `${jobs[jobId].stage || 'processing'}: ${error.message}`;
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+// Stitch a game's videos into one downloadable MP4 (see /concat-game above).
+async function processConcatGame(jobId, keys, outputFileName) {
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const tmpDir = `/tmp/cg_${jobId}`;
+  fs.mkdirSync(tmpDir, { recursive: true });
+  console.log(`[${jobId}] Concat-game: ${keys.length} video(s)`);
+
+  try {
+    // PHASE 1+2 (fused per item): download each source, normalize to a uniform
+    // 720p H.264 profile, then DELETE the raw source before the next download so
+    // peak disk stays ~1 raw + the small 720p copies.
+    const normFiles = [];
+    for (let i = 0; i < keys.length; i++) {
+      const srcPath = `${tmpDir}/src_${i}.mp4`;
+      const normPath = `${tmpDir}/norm_${i}.mp4`;
+
+      jobs[jobId].stage = 'downloading';
+      jobs[jobId].phaseItem = i + 1;
+      jobs[jobId].phaseTotal = keys.length;
+      jobs[jobId].label = `Preparing video ${i + 1} of ${keys.length}...`;
+      console.log(`[${jobId}] Downloading source ${i + 1}/${keys.length}`);
+      const signedUrl = await signObjectUrl(supabase, keys[i], SOURCE_URL_TTL_SECONDS);
+      await downloadFile(signedUrl, srcPath);
+
+      jobs[jobId].stage = 'normalizing';
+      // Identical profile across every input = a glitch-free -c copy concat.
+      // 720p H.264 yuv420p (SDR-safe), 30fps CFR, resampled audio, faststart —
+      // same family as /optimize, so it matches the app's own optimized copies.
+      // preset veryfast/crf 23 = good quality at a reasonable speed for a
+      // full-length re-encode.
+      await execAsync(
+        `ffmpeg -i ${srcPath} -vf "fps=30,scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -ar 48000 -ac 2 -fps_mode cfr -async 1 -movflags +faststart ${normPath} -y 2>&1`,
+        { maxBuffer: 10 * 1024 * 1024 },
+      );
+      try { fs.unlinkSync(srcPath); } catch (e) {}
+      normFiles.push(normPath);
+      jobs[jobId].progress = Math.round(((i + 1) / keys.length) * 75);
+    }
+
+    // PHASE 3: concat — inputs are now one identical profile, so -c copy is safe.
+    jobs[jobId].stage = 'concatenating';
+    jobs[jobId].phaseItem = null;
+    jobs[jobId].phaseTotal = null;
+    jobs[jobId].label = 'Joining videos...';
+    jobs[jobId].progress = 80;
+    const concatFile = `${tmpDir}/concat.txt`;
+    fs.writeFileSync(concatFile, normFiles.map(f => `file '${f}'`).join('\n'));
+    const outputPath = `${tmpDir}/output.mp4`;
+    console.log(`[${jobId}] Concatenating ${normFiles.length} normalized video(s)`);
+    await execAsync(
+      `ffmpeg -f concat -safe 0 -i ${concatFile} -c copy -movflags +faststart ${outputPath} -y 2>&1`,
+      { maxBuffer: 10 * 1024 * 1024 },
+    );
+    for (const f of normFiles) { try { fs.unlinkSync(f); } catch (e) {} }
+
+    // PHASE 4: upload the stitched file (resumable = memory-safe for multi-GB).
+    jobs[jobId].stage = 'uploading';
+    jobs[jobId].label = 'Uploading stitched game...';
+    jobs[jobId].progress = 85;
+    const outSize = fs.statSync(outputPath).size;
+    const fileName = `game-downloads/${Date.now()}.mp4`;
+    console.log(`[${jobId}] Uploading stitched game (${(outSize / 1024 / 1024).toFixed(0)} MB)`);
+    await resumableUpload(outputPath, fileName, outSize, (sent, total) => {
+      jobs[jobId].progress = 85 + Math.round((sent / total) * 12); // 85..97
+    });
+
+    // PHASE 5: hand back a signed URL (private bucket) — the client downloads it
+    // directly (sign-media can't authorize it; it's not a videos row).
+    const { data: signedData, error: signError } = await supabase.storage
+      .from('Videos').createSignedUrl(fileName, OUTPUT_URL_TTL_SECONDS);
+    if (signError || !signedData) {
+      throw new Error(`Could not sign output: ${signError?.message ?? 'no data'}`);
+    }
+
+    jobs[jobId].status = 'done';
+    jobs[jobId].url = signedData.signedUrl;
+    jobs[jobId].progress = 100;
+    jobs[jobId].stage = 'done';
+    jobs[jobId].label = 'Complete!';
+    console.log(`[${jobId}] Concat-game complete: ${(outSize / 1024 / 1024).toFixed(0)} MB`);
+  } catch (error) {
+    console.error(`[${jobId}] Concat-game failed at "${jobs[jobId].stage}":`, error.message);
     jobs[jobId].status = 'failed';
     jobs[jobId].error = `${jobs[jobId].stage || 'processing'}: ${error.message}`;
   } finally {
