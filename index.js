@@ -14,6 +14,13 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 const jobs = {};
 
+// Keys currently being optimized → the jobId that owns them. /optimize has no
+// other dedupe: processOptimize downloads + transcodes + uploads unconditionally,
+// so two calls for the same key (client kickoff racing a sweep or a manual retry)
+// would run TWO full ffmpeg passes on one container. In-memory like `jobs`, so a
+// restart clears it — that's correct, the job it tracked died with the container.
+const activeOptimizeKeys = new Map();
+
 // Signed-URL lifetimes (seconds). Source URLs only need to outlive a single
 // download (downloadFile caps at 30 min); 1h gives margin. The output URL is
 // handed to the client to save to the camera roll — 24h so an offline or
@@ -22,7 +29,7 @@ const SOURCE_URL_TTL_SECONDS = 3600;   // 1 hour
 const OUTPUT_URL_TTL_SECONDS = 86400;  // 24 hours
 
 app.get('/', (req, res) => {
-  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v3', optimize: 'v2' });
+  res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v3', optimize: 'v3-idempotent' });
 });
 
 app.post('/export', async (req, res) => {
@@ -44,7 +51,7 @@ app.post('/export', async (req, res) => {
       createdAt: Date.now(),
     };
     res.json({ jobId });
-    processExport(jobId, clips, outputFileName);
+    processExport(jobId, clips, outputFileName).catch((e) => console.error(`[${jobId}] processExport rejected:`, e?.message || e));
   } catch (e) {
     console.error('Export endpoint error:', e);
     res.status(500).json({ error: e.message });
@@ -85,7 +92,7 @@ app.post('/faststart', async (req, res) => {
       label: 'Queued...', createdAt: Date.now(),
     };
     res.json({ jobId });
-    processFaststart(jobId, key);
+    processFaststart(jobId, key).catch((e) => console.error(`[${jobId}] processFaststart rejected:`, e?.message || e));
   } catch (e) {
     console.error('Faststart endpoint error:', e);
     res.status(500).json({ error: e.message });
@@ -122,7 +129,7 @@ app.post('/concat-game', async (req, res) => {
       label: 'Queued...', createdAt: Date.now(),
     };
     res.json({ jobId });
-    processConcatGame(jobId, keys, outputFileName);
+    processConcatGame(jobId, keys, outputFileName).catch((e) => console.error(`[${jobId}] processConcatGame rejected:`, e?.message || e));
   } catch (e) {
     console.error('Concat-game endpoint error:', e);
     res.status(500).json({ error: e.message });
@@ -146,6 +153,14 @@ app.post('/optimize', async (req, res) => {
     if (!key || typeof key !== 'string') {
       return res.status(400).json({ error: 'No storage key provided' });
     }
+    // GUARD A (fast path): this key is already being optimized → hand back the
+    // job that owns it. Checking jobs[inFlight] too so a stale entry can't block
+    // the key forever.
+    const inFlight = activeOptimizeKeys.get(key);
+    if (inFlight && jobs[inFlight]) {
+      console.log(`[optimize] duplicate request for ${key} → returning in-flight job ${inFlight}`);
+      return res.json({ jobId: inFlight, deduped: true });
+    }
     const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
     jobs[jobId] = {
       status: 'processing', url: null, error: null, progress: 0,
@@ -153,7 +168,7 @@ app.post('/optimize', async (req, res) => {
       label: 'Queued...', createdAt: Date.now(),
     };
     res.json({ jobId });
-    processOptimize(jobId, key);
+    processOptimize(jobId, key).catch((e) => console.error(`[${jobId}] processOptimize rejected:`, e?.message || e));
   } catch (e) {
     console.error('Optimize endpoint error:', e);
     res.status(500).json({ error: e.message });
@@ -173,7 +188,7 @@ app.post('/optimize-all', async (req, res) => {
       label: 'Finding videos to optimize...', createdAt: Date.now(),
     };
     res.json({ jobId });
-    processOptimizeAll(jobId);
+    processOptimizeAll(jobId).catch((e) => console.error(`[${jobId}] processOptimizeAll rejected:`, e?.message || e));
   } catch (e) {
     console.error('Optimize-all endpoint error:', e);
     res.status(500).json({ error: e.message });
@@ -236,7 +251,7 @@ app.post('/thumbnails-backfill', async (req, res) => {
       label: 'Finding videos without a thumbnail...', createdAt: Date.now(),
     };
     res.json({ jobId });
-    processThumbnailBackfill(jobId);
+    processThumbnailBackfill(jobId).catch((e) => console.error(`[${jobId}] processThumbnailBackfill rejected:`, e?.message || e));
   } catch (e) {
     console.error('Thumbnails-backfill endpoint error:', e);
     res.status(500).json({ error: e.message });
@@ -376,7 +391,7 @@ app.post('/reel-faststart-backfill', async (req, res) => {
       label: 'Finding reels to faststart...', createdAt: Date.now(),
     };
     res.json({ jobId });
-    processReelFaststartBackfill(jobId);
+    processReelFaststartBackfill(jobId).catch((e) => console.error(`[${jobId}] processReelFaststartBackfill rejected:`, e?.message || e));
   } catch (e) {
     console.error('Reel-faststart-backfill endpoint error:', e);
     res.status(500).json({ error: e.message });
@@ -441,7 +456,7 @@ app.post('/reel-thumbnails-backfill', async (req, res) => {
       label: 'Finding reels without a thumbnail...', createdAt: Date.now(),
     };
     res.json({ jobId });
-    processReelThumbnailBackfill(jobId);
+    processReelThumbnailBackfill(jobId).catch((e) => console.error(`[${jobId}] processReelThumbnailBackfill rejected:`, e?.message || e));
   } catch (e) {
     console.error('Reel-thumbnails-backfill endpoint error:', e);
     res.status(500).json({ error: e.message });
@@ -486,13 +501,56 @@ async function processReelThumbnailBackfill(jobId) {
 
 async function processOptimize(jobId, key) {
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+  const finish = (label) => {
+    if (jobs[jobId]) {
+      jobs[jobId].status = 'done'; jobs[jobId].progress = 100;
+      jobs[jobId].stage = 'done'; jobs[jobId].label = label;
+    }
+    console.log(`[${jobId}] ${label} (${key})`);
+  };
+
+  // GUARD A (authoritative): /optimize-all calls this function DIRECTLY, bypassing
+  // the endpoint check, so the claim has to live here to cover both paths.
+  const owner = activeOptimizeKeys.get(key);
+  if (owner && owner !== jobId && jobs[owner]) {
+    finish(`Skipped — already optimizing under job ${owner}`);
+    return;
+  }
+  activeOptimizeKeys.set(key, jobId);
+
+  // GUARD B: don't burn a download + transcode on a key that is already done.
+  // Cheap (one ~50ms read) and it runs BEFORE any bytes move. A read error is
+  // NOT fatal — a transient blip must not block a legitimate optimize.
+  try {
+    const { data: rows, error: readErr } = await supabase
+      .from('videos').select('id, original_url').eq('url', key).limit(1);
+    if (readErr) {
+      console.warn(`[${jobId}] pre-check read failed (continuing): ${readErr.message}`);
+    } else if (!rows || rows.length === 0) {
+      activeOptimizeKeys.delete(key);
+      finish('Skipped — no videos row points at this key (already repointed?)');
+      return;
+    } else if (rows[0].original_url) {
+      activeOptimizeKeys.delete(key);
+      finish('Skipped — already optimized (original_url is set)');
+      return;
+    }
+  } catch (e) {
+    console.warn(`[${jobId}] pre-check threw (continuing): ${e?.message || e}`);
+  }
+
   const tmpDir = `/tmp/opt_${jobId}`;
-  fs.mkdirSync(tmpDir, { recursive: true });
   const srcPath = `${tmpDir}/src.mp4`;
   const outPath = `${tmpDir}/out.mp4`;
   console.log(`[${jobId}] Optimize requested for ${key}`);
 
   try {
+    // mkdir lives INSIDE the try so that a failure here (disk full, permissions)
+    // still reaches the finally that releases the in-flight key. Outside it, the
+    // key would stay claimed until the next restart and block every retry.
+    fs.mkdirSync(tmpDir, { recursive: true });
+
     // 1) Download the master (videos.url) to disk (streamed — memory-safe).
     jobs[jobId].stage = 'downloading';
     jobs[jobId].label = 'Downloading source...';
@@ -570,10 +628,19 @@ async function processOptimize(jobId, key) {
     jobs[jobId].label = 'Optimized!';
     console.log(`[${jobId}] Optimize complete: play ${newKey}, master kept at ${key} (${updated.length} row(s))`);
   } catch (error) {
-    console.error(`[${jobId}] Optimize failed at "${jobs[jobId].stage}":`, error.message);
-    jobs[jobId].status = 'failed';
-    jobs[jobId].error = `${jobs[jobId].stage || 'processing'}: ${error.message}`;
+    // CRASH GUARD: jobs[jobId] can be GONE here (TTL cleanup evicted it mid-run).
+    // Dereferencing it inside the catch threw a TypeError out of an un-awaited,
+    // un-caught call → Node 18 kills the process → Railway restarts → every OTHER
+    // in-flight job dies too. Read the stage defensively. Same fix in the other
+    // three long workers; the batch functions already guarded this way.
+    const stage = jobs[jobId] ? jobs[jobId].stage : '(job record evicted)';
+    console.error(`[${jobId}] Optimize failed at "${stage}":`, error.message);
+    if (jobs[jobId]) {
+      jobs[jobId].status = 'failed';
+      jobs[jobId].error = `${stage || 'processing'}: ${error.message}`;
+    }
   } finally {
+    if (activeOptimizeKeys.get(key) === jobId) activeOptimizeKeys.delete(key);
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
   }
 }
@@ -654,9 +721,12 @@ async function processFaststart(jobId, key) {
     const msg = error?.response
       ? `HTTP ${error.response.status} ${JSON.stringify(error.response.data)}`
       : error.message;
-    console.error(`[${jobId}] Faststart failed at "${jobs[jobId].stage}":`, msg);
-    jobs[jobId].status = 'failed';
-    jobs[jobId].error = `${jobs[jobId].stage || 'processing'}: ${msg}`;
+    const stage = jobs[jobId] ? jobs[jobId].stage : '(job record evicted)';
+    console.error(`[${jobId}] Faststart failed at "${stage}":`, msg);
+    if (jobs[jobId]) {
+      jobs[jobId].status = 'failed';
+      jobs[jobId].error = `${stage || 'processing'}: ${msg}`;
+    }
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
   }
@@ -780,9 +850,12 @@ async function processExport(jobId, clips, outputFileName) {
     console.log(`[${jobId}] Export complete: ${signedData.signedUrl}`);
 
   } catch (error) {
-    console.error(`[${jobId}] Export failed at stage "${jobs[jobId].stage}":`, error.message);
-    jobs[jobId].status = 'failed';
-    jobs[jobId].error = `${jobs[jobId].stage || 'processing'}: ${error.message}`;
+    const stage = jobs[jobId] ? jobs[jobId].stage : '(job record evicted)';
+    console.error(`[${jobId}] Export failed at stage "${stage}":`, error.message);
+    if (jobs[jobId]) {
+      jobs[jobId].status = 'failed';
+      jobs[jobId].error = `${stage || 'processing'}: ${error.message}`;
+    }
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
   }
@@ -869,9 +942,12 @@ async function processConcatGame(jobId, keys, outputFileName) {
     jobs[jobId].label = 'Complete!';
     console.log(`[${jobId}] Concat-game complete: ${(outSize / 1024 / 1024).toFixed(0)} MB`);
   } catch (error) {
-    console.error(`[${jobId}] Concat-game failed at "${jobs[jobId].stage}":`, error.message);
-    jobs[jobId].status = 'failed';
-    jobs[jobId].error = `${jobs[jobId].stage || 'processing'}: ${error.message}`;
+    const stage = jobs[jobId] ? jobs[jobId].stage : '(job record evicted)';
+    console.error(`[${jobId}] Concat-game failed at "${stage}":`, error.message);
+    if (jobs[jobId]) {
+      jobs[jobId].status = 'failed';
+      jobs[jobId].error = `${stage || 'processing'}: ${error.message}`;
+    }
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) {}
   }
@@ -986,18 +1062,28 @@ function downloadFile(url, dest) {
   });
 }
 
-// Drop jobs older than 1 hour. In-memory only — Railway restart wipes the
-// Map regardless. Wrapped in try/catch so a bad iteration can't kill the
-// interval timer.
-const JOB_TTL_MS = 60 * 60 * 1000;
+// Drop FINISHED jobs after an hour. Still-running jobs get a much longer hard
+// cap: the old rule evicted purely on age, so a job that outran the TTL (a long
+// concat/export, or a transcode slowed by CPU contention) had its record deleted
+// mid-flight — which made /job/:id 404 for a job that was still working, and made
+// the next jobs[jobId] write throw. The hard cap still bounds memory if a job
+// somehow never reaches a terminal state. In-memory only — a Railway restart
+// wipes the Map regardless. Wrapped in try/catch so a bad iteration can't kill
+// the interval timer.
+const JOB_TTL_MS = 60 * 60 * 1000;                 // terminal jobs
+const RUNNING_JOB_TTL_MS = 6 * 60 * 60 * 1000;     // still-running jobs (hard cap)
+const TERMINAL_JOB_STATUSES = new Set(['done', 'failed', 'partial']);
 const JOB_CLEANUP_INTERVAL_MS = 30 * 60 * 1000;
 setInterval(() => {
   try {
     const now = Date.now();
     for (const id of Object.keys(jobs)) {
-      if (now - (jobs[id].createdAt || 0) > JOB_TTL_MS) {
+      const job = jobs[id];
+      const running = !TERMINAL_JOB_STATUSES.has(job.status);
+      const ttl = running ? RUNNING_JOB_TTL_MS : JOB_TTL_MS;
+      if (now - (job.createdAt || 0) > ttl) {
         delete jobs[id];
-        console.log(`[cleanup] dropped stale job ${id}`);
+        console.log(`[cleanup] dropped ${running ? 'STUCK running' : 'finished'} job ${id}`);
       }
     }
   } catch (e) {
