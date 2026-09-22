@@ -580,7 +580,15 @@ async function processOptimize(jobId, key) {
     jobs[jobId].progress = 20;
     await execAsync(
       `ffmpeg -i ${srcPath} -map 0:v:0 -map 0:a? ` +
-      `-vf "scale=1280:720:force_original_aspect_ratio=decrease,format=yuv420p" ` +
+      // The second scale rounds DOWN to even dimensions. Fitting a PORTRAIT frame
+      // inside 1280x720 yields an odd width (a 9:16 phone video → 405x720), and
+      // libx264 with yuv420p rejects odd dimensions ("width not divisible by 2")
+      // — so every vertically-shot video failed to optimize. trunc() is used
+      // instead of force_divisible_by=2 because that needs ffmpeg >= 4.4; this
+      // form works everywhere. No-op when the dimensions are already even, so
+      // nothing that optimizes today changes. NOT padded (unlike /export and
+      // /concat-game): padding would bake black bars into a vertical video.
+      `-vf "scale=1280:720:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p" ` +
       `-c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k -movflags +faststart ${outPath} -y 2>&1`,
       { maxBuffer: 10 * 1024 * 1024 },
     );
