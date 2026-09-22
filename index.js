@@ -573,13 +573,17 @@ async function processOptimize(jobId, key) {
     console.log(`[${jobId}] Downloaded ${(fs.statSync(srcPath).size / 1024 / 1024).toFixed(0)} MB`);
 
     // 2) Transcode → 720p H.264, 8-bit yuv420p (universally decodable), faststart.
-    //    -map 0:v:0 -map 0:a? keeps first video + audio, drops timed-metadata
-    //    tracks. Real re-encode (slow, CPU-bound) — the price of "plays anywhere".
+    //    -map 0:v:0 -map 0:a:0? keeps the FIRST video + FIRST audio track and
+    //    drops timed-metadata tracks. It is 0:a:0? and NOT 0:a? because the
+    //    latter maps EVERY audio stream: a file carrying a second track with no
+    //    decoder ("Decoder (codec none) not found for input stream #0:2") failed
+    //    the whole transcode. Real re-encode (slow, CPU-bound) — the price of
+    //    "plays anywhere".
     jobs[jobId].stage = 'transcoding';
     jobs[jobId].label = 'Transcoding to 720p H.264 (this takes a while)...';
     jobs[jobId].progress = 20;
     await execAsync(
-      `ffmpeg -i ${srcPath} -map 0:v:0 -map 0:a? ` +
+      `ffmpeg -i ${srcPath} -map 0:v:0 -map 0:a:0? ` +
       // The second scale rounds DOWN to even dimensions. Fitting a PORTRAIT frame
       // inside 1280x720 yields an odd width (a 9:16 phone video → 405x720), and
       // libx264 with yuv420p rejects odd dimensions ("width not divisible by 2")
