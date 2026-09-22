@@ -3,6 +3,19 @@ const cors = require('cors');
 const { exec } = require('child_process');
 const { promisify } = require('util');
 const execAsync = promisify(exec);
+
+// ffmpeg's real complaint ("unsupported codec", "moov atom not found", …) goes to
+// the command's stdout — every ffmpeg call here ends in `2>&1`. Node builds
+// error.message from the command plus *stderr*, which those redirects leave
+// empty, so a transcode failure arrived as "Command failed: ffmpeg …" and
+// nothing else. Append the tail of the captured output so the job error says why.
+function withCmdOutput(error) {
+  const out = String(error?.stdout || error?.stderr || '').trim();
+  if (!out) return error?.message || String(error);
+  const head = String(error?.message || '').split('\n')[0];
+  const tail = out.length > 1500 ? `...${out.slice(-1500)}` : out;
+  return `${head}\n${tail}`;
+}
 const fs = require('fs');
 const https = require('https');
 const http = require('http');
@@ -634,10 +647,11 @@ async function processOptimize(jobId, key) {
     // in-flight job dies too. Read the stage defensively. Same fix in the other
     // three long workers; the batch functions already guarded this way.
     const stage = jobs[jobId] ? jobs[jobId].stage : '(job record evicted)';
-    console.error(`[${jobId}] Optimize failed at "${stage}":`, error.message);
+    const detail = withCmdOutput(error);
+    console.error(`[${jobId}] Optimize failed at "${stage}":`, detail);
     if (jobs[jobId]) {
       jobs[jobId].status = 'failed';
-      jobs[jobId].error = `${stage || 'processing'}: ${error.message}`;
+      jobs[jobId].error = `${stage || 'processing'}: ${detail}`;
     }
   } finally {
     if (activeOptimizeKeys.get(key) === jobId) activeOptimizeKeys.delete(key);
