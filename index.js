@@ -21,11 +21,189 @@ const https = require('https');
 const http = require('http');
 const { createClient } = require('@supabase/supabase-js');
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://wscfpkaltajnrhiusoze.supabase.co';
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// PRIVILEGED Supabase key. Prefers the new-API-key variable name; falls back to the
+// legacy-named one so the rename can happen in Railway without a deploy race. The VALUE
+// should be the project's `sb_secret_...` key — the legacy `eyJ...` service_role JWT is
+// public in this repo's git history (commit f3bda34) and must stop being used.
+// Never logged, never returned in a response, never sent to a client.
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+// Publishable (anon) key — safe to ship, and the ONLY key used to build the
+// caller-scoped client below. Never the service-role key.
+const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY || '';
+// Operator secret for maintenance/backfill routes. Server-side ONLY: it must never
+// appear in the web bundle, the native app, or app.json/Expo config.
+const OPERATOR_SECRET = process.env.OPERATOR_SECRET || '';
+// Phase-4 switch. While false, a request WITHOUT an Authorization header is still
+// accepted on the user routes so already-installed native builds keep rendering;
+// a request WITH one is ALWAYS verified and authorized. Set to 'true' once the
+// authenticated clients are live. This is a rollout flag, not a permanent fallback.
+const REQUIRE_USER_AUTH = String(process.env.REQUIRE_USER_AUTH || '').toLowerCase() === 'true';
+
 const app = express();
-app.use(cors());
+// CORS is defence-in-depth, NOT authorization. Native clients ignore it entirely.
+// Restricted to the real web origins; extra origins come from env, comma-separated.
+const ALLOWED_ORIGINS = new Set([
+  'https://iamsports.com',
+  'https://www.iamsports.com',
+  ...String(process.env.EXTRA_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
+]);
+app.use(cors({
+  origin(origin, cb) {
+    // No Origin header = a native app or server-to-server call; CORS does not apply.
+    if (!origin) return cb(null, true);
+    return cb(null, ALLOWED_ORIGINS.has(origin));
+  },
+}));
 app.use(express.json({ limit: '50mb' }));
 const jobs = {};
+
+// ── AUTHORIZATION ────────────────────────────────────────────────────────────
+// WHY THIS EXISTS. This service holds SUPABASE_SERVICE_ROLE_KEY, which bypasses
+// every RLS policy. Before this module, any caller on the internet could POST a
+// storage key and have private media rendered back to them, or trigger a mass
+// mutation — a second authorization door beside Supabase's. Service role may be
+// used for the media work only AFTER the caller has been authenticated and the
+// operation authorized.
+//
+// THE RULE: we never re-implement product permissions here. We build a Supabase
+// client carrying the CALLER'S OWN JWT and read through it, so RLS renders the
+// verdict. Railway and Supabase therefore cannot reach different decisions.
+
+function bearerToken(req) {
+  const h = req.headers.authorization || '';
+  const m = /^Bearer\s+(.+)$/i.exec(h.trim());
+  return m ? m[1].trim() : null;
+}
+
+// A Supabase client acting AS THE CALLER (publishable key + their JWT). Every read
+// through it is RLS-filtered exactly as it would be in the app.
+function callerClient(token) {
+  return createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+    global: { headers: { Authorization: `Bearer ${token}` } },
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+// Verify the token with Supabase (the issuer checks signature, expiry and
+// revocation) and derive the user id from the VERIFIED response — never from the
+// request body. Returns null when the token is missing/malformed/expired/invalid.
+async function verifyCaller(token) {
+  if (!token || !SUPABASE_PUBLISHABLE_KEY) return null;
+  try {
+    const client = callerClient(token);
+    const { data, error } = await client.auth.getUser();
+    if (error || !data?.user?.id) return null;
+    return { userId: data.user.id, client };
+  } catch {
+    return null;
+  }
+}
+
+// USER-FACING routes. Attaches req.userId + req.supaAsUser on success.
+// NEVER logs the token.
+async function requireUser(req, res, next) {
+  const token = bearerToken(req);
+  if (!token) {
+    if (REQUIRE_USER_AUTH) return res.status(401).json({ error: 'Authentication required.' });
+    // Legacy pre-auth client. Opportunistic: nothing to verify, nothing attached.
+    req.userId = null; req.supaAsUser = null; req.legacyUnauthenticated = true;
+    console.warn(`[auth] LEGACY unauthenticated ${req.method} ${req.path} — allowed while REQUIRE_USER_AUTH=false`);
+    return next();
+  }
+  const caller = await verifyCaller(token);
+  if (!caller) return res.status(401).json({ error: 'Invalid or expired session.' });
+  req.userId = caller.userId;
+  req.supaAsUser = caller.client;
+  req.legacyUnauthenticated = false;
+  return next();
+}
+
+// OPERATOR routes (maintenance / backfill / global mutation). Unconditional — these
+// are never called by any client, so gating them breaks nothing. An ordinary user
+// JWT is NOT accepted here.
+function requireOperator(req, res, next) {
+  if (!OPERATOR_SECRET) {
+    console.error(`[auth] OPERATOR_SECRET is not set — refusing ${req.method} ${req.path}`);
+    return res.status(503).json({ error: 'Operator routes are disabled.' });
+  }
+  const provided = req.headers['x-operator-secret'];
+  if (typeof provided !== 'string' || provided.length !== OPERATOR_SECRET.length) {
+    return res.status(401).json({ error: 'Operator authorization required.' });
+  }
+  // Constant-time compare so a wrong secret leaks no length/prefix information.
+  const a = Buffer.from(provided), b = Buffer.from(OPERATOR_SECRET);
+  if (a.length !== b.length || !require('crypto').timingSafeEqual(a, b)) {
+    return res.status(401).json({ error: 'Operator authorization required.' });
+  }
+  return next();
+}
+
+// /optimize is called by TWO legitimate callers: the app (a real user, fire-and-forget
+// after an upload) and public.sweep_stalled_optimizes() — a pg_cron job that re-fires a
+// stalled optimize every 2 minutes and has NO user identity to present. So it accepts a
+// user JWT OR the operator secret, and nothing else. Without this the sweep would 401 and
+// uploads would silently stop becoming playable.
+function requireUserOrOperator(req, res, next) {
+  if (req.headers['x-operator-secret'] !== undefined) {
+    return requireOperator(req, res, () => {
+      req.isOperator = true; req.userId = null; req.supaAsUser = null; req.legacyUnauthenticated = false;
+      return next();
+    });
+  }
+  return requireUser(req, res, next);
+}
+
+// May this caller render this reserved reel? The reel row is created by the app
+// BEFORE the render, and highlight_reels' INSERT WITH CHECK already ran
+// may_reel_clip() over its source_clip_ids — so a reel the caller can SELECT
+// through RLS is by construction a clip set they were entitled to. Reading it
+// through the caller-scoped client is what makes that true here too.
+async function authorizeReel(req, reelId) {
+  if (!req.supaAsUser) return { ok: false, status: 401, error: 'Authentication required.' };
+  const { data, error } = await req.supaAsUser
+    .from('highlight_reels')
+    .select('id, source_clip_ids, created_by_user_id')
+    .eq('id', reelId)
+    .maybeSingle();
+  if (error) return { ok: false, status: 403, error: 'Not authorized for that reel.' };
+  if (!data) return { ok: false, status: 404, error: 'Reel not found.' };
+  // Rendering is the creator's own action; a coach who can merely READ a teammate's
+  // reel must not be able to drive its render.
+  if (data.created_by_user_id !== req.userId) {
+    return { ok: false, status: 403, error: 'Not authorized for that reel.' };
+  }
+  return { ok: true, reel: data };
+}
+
+// May this caller use these storage keys? Every key must resolve to a `videos` row
+// the CALLER can SELECT under RLS. This is what stops a client pointing the
+// renderer at an arbitrary object key.
+async function authorizeKeys(req, keys) {
+  if (!req.supaAsUser) return { ok: false, status: 401, error: 'Authentication required.' };
+  const unique = [...new Set(keys)];
+  const { data, error } = await req.supaAsUser.from('videos').select('url').in('url', unique);
+  if (error) return { ok: false, status: 403, error: 'Not authorized for that media.' };
+  const readable = new Set((data || []).map(r => r.url));
+  const denied = unique.filter(k => !readable.has(k));
+  if (denied.length) {
+    // Count only — never echo the caller's keys back.
+    return { ok: false, status: 403, error: `Not authorized for ${denied.length} of ${unique.length} source files.` };
+  }
+  return { ok: true };
+}
+
+// Record the owner on a job so /job/:id can authorize the reader. Jobs live in
+// memory; an operator-started job has ownerId null and is operator-readable only.
+// Job ids were Math.random() + Date.now() — guessable, and /job/:id used to accept
+// any id as authorization. They are now CSPRNG values, and /job/:id authorizes the
+// reader regardless, so an id is never a capability on its own.
+function newJobId() {
+  return require('crypto').randomBytes(16).toString('hex');
+}
+
+function claimJob(jobId, req) {
+  if (jobs[jobId]) jobs[jobId].ownerId = req?.userId ?? null;
+}
 
 // Keys currently being optimized → the jobId that owns them. /optimize has no
 // other dedupe: processOptimize downloads + transcodes + uploads unconditionally,
@@ -45,13 +223,40 @@ app.get('/', (req, res) => {
   res.json({ status: 'IamSports server running!', supabaseConnected: !!SUPABASE_URL, faststart: 'resumable-v3', optimize: 'v3-idempotent' });
 });
 
-app.post('/export', async (req, res) => {
+// RENDER A REEL.
+//
+// PREFERRED SHAPE: { reelId }. The app has ALREADY created the highlight_reels row
+// (reserveReel), and that INSERT's WITH CHECK ran may_reel_clip() over every entry
+// in source_clip_ids — so the row IS the authorization record. We re-read it through
+// the CALLER'S client (RLS), confirm they own it, then resolve clip times and storage
+// keys server-side with service role. The client never names a storage key, so it
+// cannot point the renderer at media it is not entitled to.
+//
+// LEGACY SHAPE: { clips: [{url,start_time,end_time}] } — still accepted for
+// already-installed builds, but each url is now checked against `videos` through the
+// caller's client, so an arbitrary key is rejected. Remove this branch once
+// REQUIRE_USER_AUTH has been true long enough that no old build is in use.
+app.post('/export', requireUser, async (req, res) => {
   try {
-    const { clips, outputFileName } = req.body;
-    if (!clips || clips.length === 0) {
+    const { reelId, clips, outputFileName } = req.body || {};
+    let renderClips = null;
+
+    if (reelId) {
+      const auth = await authorizeReel(req, reelId);
+      if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+      renderClips = await resolveReelClips(auth.reel.source_clip_ids);
+      if (!renderClips.length) return res.status(400).json({ error: 'That reel has no renderable clips.' });
+    } else if (Array.isArray(clips) && clips.length > 0) {
+      if (!req.legacyUnauthenticated) {
+        const keyAuth = await authorizeKeys(req, clips.map(c => c && c.url).filter(Boolean));
+        if (!keyAuth.ok) return res.status(keyAuth.status).json({ error: keyAuth.error });
+      }
+      renderClips = clips;
+    } else {
       return res.status(400).json({ error: 'No clips provided' });
     }
-    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+
+    const jobId = newJobId();
     jobs[jobId] = {
       status: 'processing',
       url: null,
@@ -63,17 +268,54 @@ app.post('/export', async (req, res) => {
       label: 'Queued...',
       createdAt: Date.now(),
     };
+    claimJob(jobId, req);
     res.json({ jobId });
-    processExport(jobId, clips, outputFileName).catch((e) => console.error(`[${jobId}] processExport rejected:`, e?.message || e));
+    processExport(jobId, renderClips, outputFileName).catch((e) => console.error(`[${jobId}] processExport rejected:`, e?.message || e));
   } catch (e) {
     console.error('Export endpoint error:', e);
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/job/:jobId', (req, res) => {
+// source_clip_ids -> [{url, start_time, end_time}] using SERVICE ROLE, only ever
+// called after authorizeReel() has approved the reel. Clip order follows
+// source_clip_ids so the rendered reel matches what the app reserved.
+async function resolveReelClips(sourceClipIds) {
+  const ids = Array.isArray(sourceClipIds) ? sourceClipIds.filter(Boolean) : [];
+  if (!ids.length) return [];
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
+  const { data, error } = await supabase
+    .from('clips')
+    .select('id, start_time, end_time, videos ( url, upload_status )')
+    .in('id', ids);
+  if (error) throw new Error(`Could not resolve the reel's clips: ${error.message}`);
+  const byId = new Map((data || []).map(c => [c.id, c]));
+  const out = [];
+  for (const id of ids) {
+    const c = byId.get(id);
+    // Only finalized videos can be cut from — mirrors the app's `upload_status==='ready'` rule.
+    if (!c || !c.videos?.url || c.videos.upload_status !== 'ready') continue;
+    out.push({ url: c.videos.url, start_time: c.start_time, end_time: c.end_time });
+  }
+  return out;
+}
+
+// JOB STATUS. Knowing a job id is NOT authorization: the job records its owner at
+// creation and only that user may read it. Operator-started jobs (ownerId null) are
+// readable with the operator secret only. Job ids are also no longer Math.random().
+app.get('/job/:jobId', requireUser, (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.status(404).json({ error: 'Job not found' });
+  const isOwner = job.ownerId && req.userId && job.ownerId === req.userId;
+  const operatorOk = OPERATOR_SECRET && req.headers['x-operator-secret'] === OPERATOR_SECRET;
+  // A job created by a legacy unauthenticated client has ownerId null; while
+  // REQUIRE_USER_AUTH is false those stay readable so old builds can finish. Once the
+  // flag is on, no new job can have a null owner.
+  const legacyOk = !REQUIRE_USER_AUTH && job.ownerId == null;
+  if (!isOwner && !operatorOk && !legacyOk) {
+    // 404, not 403 — do not confirm that an unknown job id exists.
+    return res.status(404).json({ error: 'Job not found' });
+  }
   res.json(job);
 });
 
@@ -92,13 +334,13 @@ app.get('/job/:jobId', (req, res) => {
 // Supabase's resumable (TUS) endpoint in 15MB chunks read from disk (NOT a
 // single POST / fs.readFileSync — a multi-GB body gets reset by the gateway
 // with 'write EPROTO', and a 4.75GB Buffer would OOM the container).
-app.post('/faststart', async (req, res) => {
+app.post('/faststart', requireOperator, async (req, res) => {
   try {
     const { key } = req.body;
     if (!key || typeof key !== 'string') {
       return res.status(400).json({ error: 'No storage key provided' });
     }
-    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    const jobId = newJobId();
     jobs[jobId] = {
       status: 'processing', url: null, error: null, progress: 0,
       stage: 'starting', phaseItem: null, phaseTotal: null,
@@ -129,18 +371,25 @@ app.post('/faststart', async (req, res) => {
 // SPEED NOTE: this re-encodes each full video (the cost of one glitch-free file).
 // "Download all videos" stays the fast, no-re-encode path; this is the optional
 // single-file convenience.
-app.post('/concat-game', async (req, res) => {
+app.post('/concat-game', requireUser, async (req, res) => {
   try {
     const { keys, outputFileName } = req.body;
     if (!Array.isArray(keys) || keys.length === 0) {
       return res.status(400).json({ error: 'No video keys provided' });
     }
-    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    // Every key must resolve to a `videos` row the CALLER can SELECT under RLS —
+    // otherwise a client could stitch and download another team's film.
+    if (!req.legacyUnauthenticated) {
+      const keyAuth = await authorizeKeys(req, keys);
+      if (!keyAuth.ok) return res.status(keyAuth.status).json({ error: keyAuth.error });
+    }
+    const jobId = newJobId();
     jobs[jobId] = {
       status: 'processing', url: null, error: null, progress: 0,
       stage: 'starting', phaseItem: null, phaseTotal: null,
       label: 'Queued...', createdAt: Date.now(),
     };
+    claimJob(jobId, req);
     res.json({ jobId });
     processConcatGame(jobId, keys, outputFileName).catch((e) => console.error(`[${jobId}] processConcatGame rejected:`, e?.message || e));
   } catch (e) {
@@ -160,11 +409,20 @@ app.post('/concat-game', async (req, res) => {
 // Playback then uses videos.url (the small copy) with no app change; the master
 // stays in original_url for full-quality download/export. Nothing is deleted.
 // Poll /job/:id. Requires the videos.original_url column to exist.
-app.post('/optimize', async (req, res) => {
+app.post('/optimize', requireUserOrOperator, async (req, res) => {
   try {
     const { key } = req.body;
     if (!key || typeof key !== 'string') {
       return res.status(400).json({ error: 'No storage key provided' });
+    }
+    // The key must be a `videos` row the CALLER can SELECT under RLS. /optimize
+    // REWRITES videos.url, so an unauthorized caller must never reach it.
+    // A user caller must prove they can read this video. An OPERATOR caller (the DB
+    // sweep) has no user context — it selected the key from `videos` itself — so it is
+    // trusted by virtue of the operator secret and skips the RLS check.
+    if (!req.isOperator && !req.legacyUnauthenticated) {
+      const keyAuth = await authorizeKeys(req, [key]);
+      if (!keyAuth.ok) return res.status(keyAuth.status).json({ error: keyAuth.error });
     }
     // GUARD A (fast path): this key is already being optimized → hand back the
     // job that owns it. Checking jobs[inFlight] too so a stale entry can't block
@@ -174,12 +432,13 @@ app.post('/optimize', async (req, res) => {
       console.log(`[optimize] duplicate request for ${key} → returning in-flight job ${inFlight}`);
       return res.json({ jobId: inFlight, deduped: true });
     }
-    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    const jobId = newJobId();
     jobs[jobId] = {
       status: 'processing', url: null, error: null, progress: 0,
       stage: 'starting', phaseItem: null, phaseTotal: null,
       label: 'Queued...', createdAt: Date.now(),
     };
+    claimJob(jobId, req);
     res.json({ jobId });
     processOptimize(jobId, key).catch((e) => console.error(`[${jobId}] processOptimize rejected:`, e?.message || e));
   } catch (e) {
@@ -192,9 +451,9 @@ app.post('/optimize', async (req, res) => {
 // time (sequential — never two CPU-heavy transcodes at once). Idempotent: a
 // re-run only picks up whatever's still pending, so it's safe to fire again if it
 // gets interrupted. Poll /job/:id for phaseItem/phaseTotal progress.
-app.post('/optimize-all', async (req, res) => {
+app.post('/optimize-all', requireOperator, async (req, res) => {
   try {
-    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    const jobId = newJobId();
     jobs[jobId] = {
       status: 'processing', url: null, error: null, progress: 0,
       stage: 'listing', phaseItem: null, phaseTotal: null,
@@ -209,7 +468,7 @@ app.post('/optimize-all', async (req, res) => {
 });
 
 async function processOptimizeAll(jobId) {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
   try {
     const { data: pending, error } = await supabase
       .from('videos').select('url, label').is('original_url', null).order('created_at');
@@ -255,9 +514,9 @@ async function processOptimizeAll(jobId) {
 // current url (the small 720p copy for optimized rows), uploads thumbnails/<id>.jpg,
 // sets thumbnail_path. Sequential + idempotent (a re-run only picks up whatever's
 // still null). Poll /job/:id for phaseItem/phaseTotal.
-app.post('/thumbnails-backfill', async (req, res) => {
+app.post('/thumbnails-backfill', requireOperator, async (req, res) => {
   try {
-    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    const jobId = newJobId();
     jobs[jobId] = {
       status: 'processing', url: null, error: null, progress: 0,
       stage: 'listing', phaseItem: null, phaseTotal: null,
@@ -272,7 +531,7 @@ app.post('/thumbnails-backfill', async (req, res) => {
 });
 
 async function processThumbnailBackfill(jobId) {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
   try {
     const { data: pending, error } = await supabase
       .from('videos').select('id, url, label').is('thumbnail_path', null).order('created_at');
@@ -395,9 +654,9 @@ async function faststartReel(supabase, jobId, reelId, key) {
   }
 }
 
-app.post('/reel-faststart-backfill', async (req, res) => {
+app.post('/reel-faststart-backfill', requireOperator, async (req, res) => {
   try {
-    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    const jobId = newJobId();
     jobs[jobId] = {
       status: 'processing', url: null, error: null, progress: 0,
       stage: 'listing', phaseItem: null, phaseTotal: null,
@@ -412,7 +671,7 @@ app.post('/reel-faststart-backfill', async (req, res) => {
 });
 
 async function processReelFaststartBackfill(jobId) {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
   try {
     const { data: reels, error } = await supabase.from('highlight_reels').select('id, storage_path, name').order('created_at');
     if (error) throw new Error(`list failed: ${error.message}`);
@@ -444,13 +703,19 @@ async function processReelFaststartBackfill(jobId) {
 
 // Fire-and-forget single reel thumbnail — the client calls this right after it
 // creates a reel row. Best-effort: a failure just leaves the placeholder.
-app.post('/reel-thumbnail', async (req, res) => {
+app.post('/reel-thumbnail', requireUser, async (req, res) => {
   const { reelId } = req.body || {};
   if (!reelId) return res.status(400).json({ error: 'reelId required' });
+  // The caller must own that reel. Without this, any caller could drive a write
+  // (highlight_reels.thumbnail_path + a storage upload) against any reel id.
+  if (!req.legacyUnauthenticated) {
+    const auth = await authorizeReel(req, reelId);
+    if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
+  }
   res.json({ ok: true });
   const jobId = `reelthumb_${reelId}`;
   try {
-    const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+    const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
     const { data: reel, error } = await supabase.from('highlight_reels').select('storage_path').eq('id', reelId).maybeSingle();
     if (error || !reel?.storage_path) { console.warn(`[${jobId}] reel not found / no storage_path`); return; }
     await generateReelThumbnail(supabase, jobId, reelId, reel.storage_path);
@@ -460,9 +725,9 @@ app.post('/reel-thumbnail', async (req, res) => {
 });
 
 // Batch: backfill a poster for every reel missing one. Poll /job/:id.
-app.post('/reel-thumbnails-backfill', async (req, res) => {
+app.post('/reel-thumbnails-backfill', requireOperator, async (req, res) => {
   try {
-    const jobId = Math.random().toString(36).substring(2) + Date.now().toString(36);
+    const jobId = newJobId();
     jobs[jobId] = {
       status: 'processing', url: null, error: null, progress: 0,
       stage: 'listing', phaseItem: null, phaseTotal: null,
@@ -477,7 +742,7 @@ app.post('/reel-thumbnails-backfill', async (req, res) => {
 });
 
 async function processReelThumbnailBackfill(jobId) {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
   try {
     const { data: pending, error } = await supabase
       .from('highlight_reels').select('id, storage_path, name').is('thumbnail_path', null).order('created_at');
@@ -513,7 +778,7 @@ async function processReelThumbnailBackfill(jobId) {
 }
 
 async function processOptimize(jobId, key) {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
 
   const finish = (label) => {
     if (jobs[jobId]) {
@@ -672,7 +937,7 @@ async function processOptimize(jobId, key) {
 }
 
 async function processFaststart(jobId, key) {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
   const tmpDir = `/tmp/fs_${jobId}`;
   fs.mkdirSync(tmpDir, { recursive: true });
   const srcPath = `${tmpDir}/src.mp4`;
@@ -759,7 +1024,7 @@ async function processFaststart(jobId, key) {
 }
 
 async function processExport(jobId, clips, outputFileName) {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
   const tmpDir = `/tmp/${jobId}`;
   fs.mkdirSync(tmpDir, { recursive: true });
   console.log(`[${jobId}] Starting export with ${clips.length} clips`);
@@ -889,7 +1154,7 @@ async function processExport(jobId, clips, outputFileName) {
 
 // Stitch a game's videos into one downloadable MP4 (see /concat-game above).
 async function processConcatGame(jobId, keys, outputFileName) {
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
   const tmpDir = `/tmp/cg_${jobId}`;
   fs.mkdirSync(tmpDir, { recursive: true });
   console.log(`[${jobId}] Concat-game: ${keys.length} video(s)`);
