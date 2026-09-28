@@ -1265,8 +1265,8 @@ async function signObjectUrl(supabase, key, expiresInSeconds) {
 async function resumableUpload(filePath, objectKey, size, onProgress) {
   const b64 = (s) => Buffer.from(s, 'utf8').toString('base64');
   const authHeaders = {
-    authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
-    apikey: SUPABASE_SERVICE_ROLE_KEY,
+    authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+    apikey: SUPABASE_SECRET_KEY,
   };
 
   // Create the upload session → server returns the chunk-PATCH URL in Location.
